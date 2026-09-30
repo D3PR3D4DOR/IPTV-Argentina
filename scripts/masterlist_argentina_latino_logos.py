@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Masterlist Argentina + Premium Latinoamerica v10 - Logo Manager
+Masterlist Argentina + Premium Latinoamerica - Logo Manager
 
 Objetivo:
 - leer una M3U existente sin cambiar canales ni URLs;
@@ -61,9 +61,10 @@ IPTV_ORG_CHANNELS = "https://iptv-org.github.io/api/channels.json"
 IPTV_ORG_LOGOS = "https://iptv-org.github.io/api/logos.json"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 
-UA = "Masterlist-Argentina-LATAM/10.0"
+UA = "Masterlist-Argentina-LATAM/1.1"
 SOURCE_TIMEOUT = 25
 COMMONS_TIMEOUT = 15
+LOGO_THUMB_WIDTH = 600
 
 RASTER_FORMATS = {
     "PNG", "JPEG", "JPG", "WEBP", "GIF", "AVIF", "APNG"
@@ -273,7 +274,35 @@ def build_iptv_org_indexes(
 
 def logo_format_rank(item: dict) -> int:
     fmt = str(item.get("format", "")).upper()
-    return 1 if fmt in RASTER_FORMATS else 0
+    return 3 if fmt in RASTER_FORMATS else 0
+
+
+def logo_visibility_score(item: dict) -> int:
+    """
+    Prioriza variantes que suelen verse mejor sobre interfaces oscuras.
+    iptv-org publica tags como "white", "horizontal", etc.
+    """
+    tags = {
+        str(x).strip().lower()
+        for x in (item.get("tags") or [])
+        if x
+    }
+
+    score = 0
+
+    if "white" in tags or "light" in tags:
+        score += 35
+
+    if "horizontal" in tags:
+        score += 8
+
+    if "black" in tags or "dark" in tags:
+        score -= 25
+
+    if "transparent" in tags:
+        score -= 3
+
+    return score
 
 
 def choose_logo(
@@ -292,35 +321,149 @@ def choose_logo(
     if not usable:
         return None
 
-    # Preferimos logos en uso.
-    in_use = [x for x in usable if x.get("in_use") is True]
-    if in_use:
-        usable = in_use
+    def rank(item: dict) -> tuple[int, int, int, int, int]:
+        fmt_rank = logo_format_rank(item)
+        visibility = logo_visibility_score(item)
 
-    if preferred_feed:
-        exact_feed = [
-            x for x in usable
-            if str(x.get("feed") or "").strip().lower() == preferred_feed.lower()
-        ]
-        if exact_feed:
-            usable = exact_feed
+        feed_match = 1 if (
+            preferred_feed
+            and str(item.get("feed") or "").strip().lower() == preferred_feed.lower()
+        ) else 0
 
-    # Muchos reproductores manejan mejor PNG/JPEG/WebP que SVG.
-    usable.sort(
-        key=lambda x: (
-            logo_format_rank(x),
-            int(x.get("width") or 0),
-            int(x.get("height") or 0),
-        ),
-        reverse=True,
-    )
+        in_use = 1 if item.get("in_use") is True else 0
 
+        width = int(item.get("width") or 0)
+        height = int(item.get("height") or 0)
+
+        # Preferimos tamaños razonables para clientes IPTV. Evitamos logos
+        # gigantes si existe una variante equivalente más pequeña.
+        size_score = 1 if 150 <= max(width, height) <= 1600 else 0
+
+        return (
+            fmt_rank,
+            visibility,
+            feed_match * 30 + in_use * 20 + size_score * 5,
+            width,
+            height,
+        )
+
+    # IMPORTANTE:
+    # - primero raster (PNG/JPEG/WebP/...)
+    # - después visibilidad
+    # - después feed/in_use
+    # - SVG queda como última opción y será rasterizado si es de Wikimedia.
+    usable.sort(key=rank, reverse=True)
+
+    for item in usable:
+        if logo_format_rank(item) > 0:
+            return item
+
+    # Si no existe una versión raster, devolvemos la mejor vectorial.
+    # El llamador intentará obtener un thumbnail PNG/JPEG de Wikimedia.
     return usable[0]
+
+
+def wikimedia_raster_url(
+    session: requests.Session,
+    url: str,
+) -> Optional[str]:
+    """
+    Para un logo SVG alojado en Wikimedia Commons obtiene un thumbnail
+    rasterizado mediante la API de Wikimedia. Así evitamos entregar SVG
+    directamente a reproductores IPTV con soporte limitado.
+    """
+    if "upload.wikimedia.org/" not in url:
+        return None
+
+    try:
+        filename = url.split("/")[-1].split("?", 1)[0]
+        if not filename:
+            return None
+
+        params = {
+            "action": "query",
+            "titles": f"File:{filename}",
+            "prop": "imageinfo",
+            "iiprop": "url|mime|size",
+            "iiurlwidth": LOGO_THUMB_WIDTH,
+            "format": "json",
+            "formatversion": "2",
+        }
+
+        r = session.get(
+            COMMONS_API,
+            params=params,
+            timeout=COMMONS_TIMEOUT,
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json",
+            },
+        )
+        r.raise_for_status()
+
+        data = r.json()
+        pages = data.get("query", {}).get("pages", [])
+        if not isinstance(pages, list) or not pages:
+            return None
+
+        info = pages[0].get("imageinfo") or []
+        if not info:
+            return None
+
+        image = info[0]
+        thumb = str(image.get("thumburl") or "")
+        if thumb.startswith("https://"):
+            return thumb
+
+    except (requests.RequestException, ValueError):
+        return None
+
+    return None
+
+
+def make_raster_result(
+    session: requests.Session,
+    item: dict,
+    source: str,
+    confidence: int,
+    reason: str,
+) -> Optional[LogoResult]:
+    url = str(item.get("url", "")).strip()
+    fmt = str(item.get("format", "")).upper()
+
+    if not url.startswith("https://"):
+        return None
+
+    # Los formatos raster se usan directamente.
+    if fmt in RASTER_FORMATS:
+        return LogoResult(
+            url=url,
+            source=source,
+            confidence=confidence,
+            reason=reason,
+        )
+
+    # SVG: solo lo aceptamos si Wikimedia puede entregarnos un thumbnail
+    # rasterizado.
+    if fmt == "SVG" or url.lower().split("?", 1)[0].endswith(".svg"):
+        raster = wikimedia_raster_url(session, url)
+        if raster:
+            return LogoResult(
+                url=raster,
+                source=f"{source}:rasterizado",
+                confidence=confidence,
+                reason=f"{reason}; thumbnail PNG/JPEG generado por Wikimedia",
+            )
+        return None
+
+    return None
+
 
 
 def exact_iptv_org_logo(
     tvg_id: str,
     channel_index: dict[str, list[dict]],
+    session: requests.Session,
 ) -> Optional[LogoResult]:
     if not tvg_id:
         return None
@@ -331,14 +474,18 @@ def exact_iptv_org_logo(
     for channel_id in (tvg_id, base):
         item = choose_logo(channel_index.get(channel_id, []), feed)
         if item:
-            return LogoResult(
-                url=str(item["url"]),
-                source="iptv-org:exact",
-                confidence=100,
-                reason=f"match exacto tvg-id={channel_id}",
+            result = make_raster_result(
+                session,
+                item,
+                "iptv-org:exact",
+                100,
+                f"match exacto tvg-id={channel_id}",
             )
+            if result:
+                return result
 
     return None
+
 
 
 def fuzzy_iptv_org_logo(
@@ -347,6 +494,7 @@ def fuzzy_iptv_org_logo(
     channels: list[dict],
     channel_index: dict[str, list[dict]],
     premium: bool,
+    session: requests.Session,
 ) -> Optional[LogoResult]:
     query_names = [name]
 
@@ -374,7 +522,6 @@ def fuzzy_iptv_org_logo(
             for c in candidates
         )
 
-        # En Premium LATAM priorizamos canales claramente regionales.
         regional_bonus = 0.0
         if premium:
             region_text = " ".join(
@@ -393,22 +540,23 @@ def fuzzy_iptv_org_logo(
     confidence = int(best[0] * 100)
     channel = best[1]
 
-    # Umbral alto para evitar asignar logos equivocados.
     if not channel or confidence < (88 if premium else 84):
         return None
 
     channel_id = str(channel.get("id", "")).strip()
     logo = choose_logo(channel_index.get(channel_id, []))
-
     if not logo:
         return None
 
-    return LogoResult(
-        url=str(logo["url"]),
-        source="iptv-org:name",
-        confidence=confidence,
-        reason=f"match por nombre -> {channel_id}",
+    return make_raster_result(
+        session,
+        logo,
+        "iptv-org:name",
+        confidence,
+        f"match por nombre -> {channel_id}",
     )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +579,7 @@ def commons_logo_search(
         "gsrlimit": "10",
         "prop": "imageinfo",
         "iiprop": "url|mime|size",
-        "iiurlwidth": "1200",
+        "iiurlwidth": LOGO_THUMB_WIDTH,
         "format": "json",
         "formatversion": "2",
     }
@@ -465,15 +613,27 @@ def commons_logo_search(
 
         image = info[0]
         url = str(image.get("thumburl") or image.get("url") or "")
-        mime = str(image.get("mime") or "").lower()
+        mime = str(image.get("thumbmime") or image.get("mime") or "").lower()
 
         if not url.startswith("https://"):
             continue
 
+        # Wikimedia entrega thumburl rasterizado incluso cuando el original
+        # es SVG. Evitamos URL SVG directas en el resultado final.
+        if url.lower().split("?", 1)[0].endswith(".svg"):
+            continue
+
+        if mime.startswith("image/") and mime not in {"image/svg+xml"}:
+            pass
+        elif not mime:
+            # Si no llega thumbmime, la extensión del thumburl debe ser raster.
+            if not re.search(r"\.(?:png|jpe?g|webp|gif|avif|apng)(?:$|[?])", url, re.I):
+                continue
+        else:
+            continue
+
         title_norm = canon(title)
 
-        # Para el fallback web exigimos una señal clara de que el archivo
-        # es un logo y que el nombre del canal aparece en el titulo.
         has_logo_word = "logo" in title_norm or "wordmark" in title_norm
         if not has_logo_word:
             continue
@@ -482,8 +642,10 @@ def commons_logo_search(
         if name_norm_contains(name, title):
             similarity = max(similarity, 0.90)
 
-        if mime in {"image/svg+xml"}:
-            similarity -= 0.01
+        # Preferimos thumbnails de imagen reales; no penalizamos un logo
+        # correcto por ser un thumbnail raster.
+        if "white" in title_norm:
+            similarity = min(1.0, similarity + 0.03)
 
         if similarity > best[0]:
             best = (similarity, {"url": url, "title": title})
@@ -493,16 +655,12 @@ def commons_logo_search(
 
     return LogoResult(
         url=best[1]["url"],
-        source="Wikimedia Commons",
+        source="Wikimedia Commons:raster",
         confidence=int(best[0] * 100),
         reason=f"busqueda web -> {best[1]['title']}",
     )
 
 
-def name_norm_contains(name: str, title: str) -> bool:
-    q = tokenize(name)
-    t = tokenize(title)
-    return bool(q) and q.issubset(t)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +682,11 @@ def resolve_logo(
     name = visible_name(extinf)
     premium = is_premium_line(extinf)
 
-    exact = exact_iptv_org_logo(tvg_id, channel_index)
+    exact = exact_iptv_org_logo(
+        tvg_id,
+        channel_index,
+        session,
+    )
     if exact:
         return exact
 
@@ -534,6 +696,7 @@ def resolve_logo(
         channels,
         channel_index,
         premium,
+        session,
     )
     if fuzzy:
         return fuzzy
@@ -546,8 +709,10 @@ def resolve_logo(
     return LogoResult(
         source="NO ENCONTRADO",
         confidence=0,
-        reason="No se encontro un logo con suficiente confianza.",
+        reason="No se encontro un logo raster compatible con suficiente confianza.",
     )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +721,7 @@ def resolve_logo(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Completa tvg-logo de una M3U sin tocar canales ni URLs."
+        description="Completa tvg-logo de una M3U sin tocar canales ni URLs; prioriza imagenes raster compatibles (PNG/JPEG/WebP)."
     )
 
     parser.add_argument(
@@ -658,6 +823,7 @@ def main() -> int:
         exact = exact_iptv_org_logo(
             extract_attr(extinf, "tvg-id"),
             channel_index,
+            session,
         )
 
         if exact:
@@ -670,6 +836,7 @@ def main() -> int:
             channels,
             channel_index,
             is_premium_line(extinf),
+            session,
         )
 
         if fuzzy:
@@ -724,7 +891,7 @@ def main() -> int:
     refreshed = 0
 
     report_lines = [
-        "Masterlist Argentina + Premium Latinoamerica v10 - Logo Report",
+        "Masterlist Argentina + Premium Latinoamerica Logo Report",
         "=" * 72,
         f"M3U entrada: {input_path}",
         f"M3U salida: {output_path}",
@@ -737,7 +904,7 @@ def main() -> int:
             LogoResult(
                 source="NO ENCONTRADO",
                 confidence=0,
-                reason="No se obtuvo resultado.",
+                reason="No se obtuvo resultado raster compatible.",
             ),
         )
 
