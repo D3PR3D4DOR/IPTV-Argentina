@@ -37,6 +37,7 @@ import concurrent.futures
 import hashlib
 import re
 import shutil
+import shutil
 import sys
 import time
 import unicodedata
@@ -52,6 +53,8 @@ from PIL import Image
 SITE = "https://tvlibreonline.st/"
 CHANNEL_ROOT = urljoin(SITE, "en-vivo/")
 TIMEOUT = 25
+DOWNLOAD_RETRIES = 3
+EXISTING_WORKERS = 8
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_LOGO_SIZE = 600
 PADDING = 18
@@ -241,21 +244,35 @@ def make_session() -> requests.Session:
 
 
 def get_bytes(session: requests.Session, url: str) -> bytes:
-    response = session.get(
-        url,
-        timeout=TIMEOUT,
-        allow_redirects=True,
-        headers={
-            **SITE_HEADERS,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        },
+    last_error: Exception | None = None
+
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            response = session.get(
+                url,
+                timeout=TIMEOUT,
+                allow_redirects=True,
+                headers={
+                    **SITE_HEADERS,
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+            )
+            response.raise_for_status()
+
+            if len(response.content) > MAX_IMAGE_BYTES:
+                raise RuntimeError("imagen demasiado grande")
+
+            return response.content
+
+        except (requests.RequestException, RuntimeError) as exc:
+            last_error = exc
+
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(0.6 * attempt)
+
+    raise RuntimeError(
+        f"No se pudo descargar tras {DOWNLOAD_RETRIES} intentos: {last_error}"
     )
-    response.raise_for_status()
-
-    if len(response.content) > MAX_IMAGE_BYTES:
-        raise RuntimeError("imagen demasiado grande")
-
-    return response.content
 
 
 def image_filename(entry: Entry) -> str:
@@ -861,7 +878,10 @@ def main() -> int:
     )
 
     # ---------------------------------------------------------------
-    # 1) Copiar/descargar todos los logos ya existentes.
+    # 1) Descargar todos los logos ya existentes.
+    #    Se descarga cada URL única una sola vez y luego se copia el PNG
+    #    a cada canal que comparte esa misma URL. Esto evita falsos FAIL
+    #    en canales como Telefe Interior/Telefe Rosario.
     # ---------------------------------------------------------------
     existing_results: dict[tuple[str, str], Result] = {}
 
@@ -872,51 +892,92 @@ def main() -> int:
             "desde sus URLs originales..."
         )
 
-        # Principal primero para que conserve prioridad.
-        source_entries = (
-            existing
-            + [
-                x for x in additional_entries
-                if x.logo_url
+        url_owner: dict[str, Entry] = {}
+        for entry in existing + [
+            x for x in additional_entries if x.logo_url
+        ]:
+            url_owner.setdefault(entry.logo_url, entry)
+
+        jobs = list(url_owner.values())
+
+        def download_unique(entry: Entry) -> tuple[str, Entry, Result]:
+            result = download_existing(entry, logo_dir)
+            return entry.logo_url, entry, result
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=EXISTING_WORKERS
+        ) as executor:
+            futures = [
+                executor.submit(download_unique, entry)
+                for entry in jobs
             ]
-        )
 
-        seen_urls: set[str] = set()
-        jobs: list[Entry] = []
+            for position, future in enumerate(
+                concurrent.futures.as_completed(futures),
+                start=1,
+            ):
+                url, entry, result = future.result()
+                print(
+                    f"[M3U {position:>3}/{len(jobs)}] "
+                    f"{'OK' if result.path else 'FAIL':<4} "
+                    f"{entry.name}"
+                )
 
-        for entry in source_entries:
-            if entry.logo_url in seen_urls:
-                continue
+                # Guardar resultado del URL original.
+                if result.path:
+                    for target_entry in (
+                        existing + [
+                            x for x in additional_entries
+                            if x.logo_url == url
+                        ]
+                    ):
+                        target_key = (
+                            canon(target_entry.tvg_id),
+                            canon(target_entry.name),
+                        )
 
-            seen_urls.add(entry.logo_url)
-            jobs.append(entry)
+                        target = logo_dir / image_filename(target_entry)
 
-        for position, entry in enumerate(
-            jobs,
-            start=1,
-        ):
-            key = (
-                canon(entry.tvg_id),
-                canon(entry.name),
-            )
+                        if target_entry is entry:
+                            existing_results[target_key] = result
+                            continue
 
-            # No sobrescribimos el resultado de una entrada principal
-            # con una M3U adicional.
-            if key in existing_results:
-                continue
-
-            result = download_existing(
-                entry,
-                logo_dir,
-            )
-
-            existing_results[key] = result
-
-            print(
-                f"[M3U {position:>3}/{len(jobs)}] "
-                f"{'OK' if result.path else 'FAIL':<4} "
-                f"{entry.name}"
-            )
+                        try:
+                            shutil.copy2(
+                                result.path,
+                                target,
+                            )
+                            existing_results[target_key] = Result(
+                                path=target,
+                                source="M3U (URL compartida)",
+                                reason=(
+                                    f"misma URL de logo que {entry.name}; "
+                                    f"{url}"
+                                ),
+                            )
+                        except Exception as exc:
+                            existing_results[target_key] = Result(
+                                source="M3U - ERROR COPIA",
+                                reason=(
+                                    f"{type(exc).__name__}: {exc} | "
+                                    f"url={url}"
+                                ),
+                            )
+                else:
+                    # Todos los canales que usan la misma URL quedan marcados
+                    # con el mismo fallo.
+                    for target_entry in (
+                        existing + [
+                            x for x in additional_entries
+                            if x.logo_url == url
+                        ]
+                    ):
+                        existing_results[
+                            (
+                                canon(target_entry.tvg_id),
+                                canon(target_entry.name),
+                            )
+                        ] = result
 
     # ---------------------------------------------------------------
     # 2) Preparar links de TVLibre y resolver faltantes.
