@@ -1,0 +1,45 @@
+name: Update YouTube Live M3U
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Generate YouTube M3U
+        run: |
+          python youtube-live/generate_youtube_m3u.py
+
+      - name: Show generated playlist
+        run: |
+          cat youtube-live/youtube.m3u8
+
+      - name: Commit updated playlist
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add youtube-live/youtube.m3u8
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update YouTube live streams"
+            git push
+          fi
