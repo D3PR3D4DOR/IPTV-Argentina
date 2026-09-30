@@ -3,55 +3,64 @@
 Masterlist Argentina + Premium Latinoamerica - Logo Manager
 
 Objetivo:
-- leer una M3U existente sin cambiar canales ni URLs;
-- conservar todas las entradas y opciones #EXTVLCOPT intactas;
-- completar los tvg-logo que falten;
-- buscar primero en la API publica de iptv-org;
-- usar coincidencia por tvg-id y, si no alcanza, por nombre/alias;
-- como ultimo recurso, buscar un logo en Wikimedia Commons;
-- generar un informe de lo encontrado y de los canales que quedaron sin logo.
+- procesar TODOS los canales de una M3U;
+- descargar una copia local PNG de cada logo;
+- conservar canales, URLs, tvg-id y #EXTVLCOPT sin cambios;
+- buscar logos en varias fuentes antes de marcar un canal como no encontrado;
+- priorizar PNG adecuados para interfaces IPTV oscuras;
+- generar una M3U de salida y un informe detallado.
+
+Fuentes de logo, en este orden general:
+1. tv-logo/tv-logos
+2. Fourqui/tv
+3. logo-tv/tv-logos
+4. hmlendea/tv-logos
+5. iptv-org
+6. logo actual de la M3U
+7. Wikimedia Commons
+8. Bing Images
+9. Google Images
+
+El orden real puede cambiar por coincidencia y disponibilidad.
 
 IMPORTANTE:
-- Por defecto NO reemplaza logos que ya existan.
-- Solo modifica la linea #EXTINF agregando/reemplazando tvg-logo.
-- Nunca cambia la URL del stream.
-- Nunca elimina canales.
-- Nunca reemplaza el stream por otro.
-- Si no encuentra un logo con suficiente confianza, lo deja sin logo y lo informa.
+- El script NO cambia ninguna URL de stream.
+- NO elimina canales.
+- NO modifica #EXTVLCOPT.
+- Los logos se guardan localmente como PNG.
+- Con --logo-base-url la M3U queda preparada para apuntar a GitHub.
+- Con --clean-logo-dir se elimina la carpeta de logos al comenzar,
+  evitando duplicados de ejecuciones anteriores.
 
 Dependencias:
     pip install requests Pillow
 
-Uso:
-    python3 scripts/masterlist_argentina_latino_logos.py
-
-Ejemplo:
+Uso recomendado:
     python3 scripts/masterlist_argentina_latino_logos.py \
-        --input masterlist_argentina_latino.m3u \
-        --output masterlist_argentina_latino_logos.m3u \
-        --report masterlist_argentina_latino_logos_report.txt
-
-Para volver a buscar y actualizar tambien los logos existentes:
-    python3 scripts/masterlist_argentina_latino_logos.py --rasterize-existing
+      --input masterlist_argentina_latino.m3u \
+      --output masterlist_argentina_latino_logos.m3u \
+      --report masterlist_argentina_latino_logos_report.txt \
+      --clean-logo-dir \
+      --logo-base-url "https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos"
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import html
 import io
 import json
-import hashlib
 import re
+import shutil
 import sys
-import threading
 import time
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, unquote, urljoin
 
 import requests
 from PIL import Image
@@ -61,59 +70,100 @@ from PIL import Image
 # CONFIGURACION
 # ---------------------------------------------------------------------------
 
+UA = "Masterlist-Argentina-LATAM-LogoManager/2.0"
+
 IPTV_ORG_CHANNELS = "https://iptv-org.github.io/api/channels.json"
 IPTV_ORG_LOGOS = "https://iptv-org.github.io/api/logos.json"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
-TV_LOGOS_TREE = "https://api.github.com/repos/tv-logo/tv-logos/git/trees/main?recursive=1"
-TV_LOGOS_RAW = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/"
 
-UA = "Masterlist-Argentina-LATAM/1.1"
-SOURCE_TIMEOUT = 25
-COMMONS_TIMEOUT = 15
-LOGO_THUMB_WIDTH = 600
+GITHUB_TREE_SOURCES = [
+    ("tv-logo/tv-logos", "main", "tv-logo"),
+    ("Fourqui/tv", "main", "fourqui"),
+    ("logo-tv/tv-logos", "main", "logo-tv"),
+    ("hmlendea/tv-logos", "master", "hmlendea"),
+]
+
+BING_IMAGES_URL = "https://www.bing.com/images/search"
+GOOGLE_IMAGES_URL = "https://www.google.com/search"
+
+SOURCE_TIMEOUT = 20
+SEARCH_TIMEOUT = 20
+LOGO_THUMB_WIDTH = 800
 LOGO_MAX_SIZE = 600
 LOGO_PADDING = 18
-TV_LOGOS_MIN_SCORE = 0.70
-WIKIMEDIA_MIN_INTERVAL = 1.25
-WIKIMEDIA_MAX_RETRIES = 5
-WIKIMEDIA_LOCK = threading.Lock()
-WIKIMEDIA_LAST_REQUEST = 0.0
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+
+# Fuentes locales tienen prioridad porque permiten almacenar nosotros mismos
+# una copia PNG y evitan depender de un servidor externo.
+SOURCE_PRIORITY = {
+    "tv-logo": 100,
+    "fourqui": 96,
+    "logo-tv": 92,
+    "hmlendea": 88,
+    "iptv-org": 84,
+    "m3u": 80,
+    "Wikimedia Commons": 72,
+    "Bing Images": 62,
+    "Google Images": 58,
+}
 
 RASTER_FORMATS = {
     "PNG", "JPEG", "JPG", "WEBP", "GIF", "AVIF", "APNG"
 }
 
 REGION_MARKERS = (
+    "argentina",
     "latin america",
     "latinamerica",
     "latinoamerica",
     "latinoamérica",
+    "world latin america",
     "panregional",
     "andes",
     "south",
-    "mexico",
     "chile",
-    "argentina",
+    "mexico",
     "central america",
     "america latina",
     "américa latina",
 )
-
 
 # ---------------------------------------------------------------------------
 # MODELOS
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ChannelEntry:
+    index: int
+    extinf: str
+    url: str
+    tvg_id: str
+    name: str
+    group: str
+    current_logo: str
+
+
+@dataclass
+class LogoCandidate:
+    url: str
+    source: str
+    match: float
+    reason: str = ""
+    feed: str = ""
+
+
+@dataclass
 class LogoResult:
+    path: Optional[Path] = None
     url: str = ""
     source: str = ""
     confidence: int = 0
     reason: str = ""
+    white_background: bool = False
 
 
 # ---------------------------------------------------------------------------
-# TEXTO / NORMALIZACION
+# NORMALIZACION
 # ---------------------------------------------------------------------------
 
 def canon(value: str) -> str:
@@ -131,20 +181,62 @@ def tokenize(value: str) -> set[str]:
     stop = {
         "tv", "channel", "canal", "latin", "america", "latinoamerica",
         "latino", "panregional", "south", "andes", "hd", "sd", "the",
+        "argentina", "world", "international", "network",
     }
     return {
-        x for x in canon(value).split()
-        if len(x) >= 2 and x not in stop
+        token
+        for token in canon(value).split()
+        if len(token) >= 2 and token not in stop
     }
+
+
+def name_similarity(a: str, b: str) -> float:
+    aa = canon(a)
+    bb = canon(b)
+
+    if not aa or not bb:
+        return 0.0
+
+    score = SequenceMatcher(None, aa, bb).ratio()
+
+    at = tokenize(a)
+    bt = tokenize(b)
+    if at and bt:
+        overlap = len(at & bt) / max(len(at), len(bt))
+        score = max(score, overlap)
+
+    if aa == bb:
+        score = 1.0
+
+    return score
+
+
+def region_score(value: str) -> float:
+    n = canon(value)
+    score = 0.0
+
+    for marker in REGION_MARKERS:
+        if canon(marker) in n:
+            score += 0.03
+
+    return min(score, 0.15)
+
+
+def image_slug(name: str, tvg_id: str) -> str:
+    base = canon(tvg_id) or canon(name) or "channel"
+    base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+    digest = SequenceMatcher(None, name, tvg_id).ratio()
+    suffix = f"{int(digest * 1_000_000):06d}"
+    return f"{base[:70]}-{suffix}.png"
 
 
 def extract_attr(line: str, attr: str) -> str:
-    m = re.search(
+    match = re.search(
         rf'{re.escape(attr)}="([^"]*)"',
         line,
         flags=re.IGNORECASE,
     )
-    return m.group(1).strip() if m else ""
+    return match.group(1).strip() if match else ""
 
 
 def visible_name(extinf: str) -> str:
@@ -152,13 +244,12 @@ def visible_name(extinf: str) -> str:
 
 
 def set_attr(line: str, attr: str, value: str) -> str:
-    escaped = value.replace('"', "%22")
-
     pattern = rf'{re.escape(attr)}="[^"]*"'
+
     if re.search(pattern, line, flags=re.IGNORECASE):
         return re.sub(
             pattern,
-            f'{attr}="{escaped}"',
+            f'{attr}="{value.replace(chr(34), "%22")}"',
             line,
             count=1,
             flags=re.IGNORECASE,
@@ -168,42 +259,7 @@ def set_attr(line: str, attr: str, value: str) -> str:
     if comma < 0:
         return line
 
-    return line[:comma] + f' {attr}="{escaped}"' + line[comma:]
-
-
-def tvg_id_base(tvg_id: str) -> str:
-    return tvg_id.split("@", 1)[0].strip()
-
-
-def region_score(text: str) -> int:
-    n = canon(text)
-    score = 0
-    for marker in REGION_MARKERS:
-        if canon(marker) in n:
-            score += 10
-    return score
-
-
-def name_similarity(query: str, candidate: str) -> float:
-    q = canon(query)
-    c = canon(candidate)
-
-    if not q or not c:
-        return 0.0
-
-    score = SequenceMatcher(None, q, c).ratio()
-
-    qt = tokenize(query)
-    ct = tokenize(candidate)
-
-    if qt and ct:
-        overlap = len(qt & ct) / max(len(qt), len(ct))
-        score = max(score, overlap)
-
-    if q == c:
-        score = 1.0
-
-    return score
+    return line[:comma] + f' {attr}="{value}"' + line[comma:]
 
 
 # ---------------------------------------------------------------------------
@@ -211,441 +267,604 @@ def name_similarity(query: str, candidate: str) -> float:
 # ---------------------------------------------------------------------------
 
 def load_m3u(path: Path) -> list[str]:
-    try:
-        raw = path.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise RuntimeError(f"No se pudo leer {path}: {exc}") from exc
-
+    raw = path.read_text(encoding="utf-8-sig")
     return raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
 
 def save_m3u(path: Path, lines: list[str]) -> None:
     text = "\n".join(lines)
-
     if not text.endswith("\n"):
         text += "\n"
 
-    # Las playlists M3U publicas de iptv-org usan CRLF.
-    path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# TV-LOGO/Tv-logos - FALLBACK PNG PARA FONDOS OSCUROS
-# ---------------------------------------------------------------------------
-
-def build_tv_logo_index(session: requests.Session) -> list[str]:
-    """
-    Obtiene una sola vez el arbol del repositorio tv-logo/tv-logos.
-
-    Ese repositorio publica logos en PNG y declara que estan preparados para
-    fondos oscuros, por lo que es una fuente especialmente util cuando
-    Wikimedia no responde o entrega una variante poco visible.
-    """
-    try:
-        r = session.get(
-            TV_LOGOS_TREE,
-            timeout=COMMONS_TIMEOUT,
-            headers={
-                "User-Agent": UA,
-                "Accept": "application/json",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError):
-        return []
-
-    tree = data.get("tree", [])
-    if not isinstance(tree, list):
-        return []
-
-    paths = []
-    for item in tree:
-        if not isinstance(item, dict):
-            continue
-
-        item_type = str(item.get("type", ""))
-        item_path = str(item.get("path", ""))
-
-        if item_type != "blob":
-            continue
-        if not item_path.lower().endswith(".png"):
-            continue
-
-        paths.append(item_path)
-
-    return paths
-
-
-def tv_logo_name_score(
-    name: str,
-    tvg_id: str,
-    path: str,
-) -> float:
-    filename = Path(path).stem
-    q_names = [name, tvg_id_base(tvg_id)]
-
-    best = 0.0
-    for query in q_names:
-        if not query:
-            continue
-
-        score = name_similarity(query, filename)
-
-        q_tokens = tokenize(query)
-        f_tokens = tokenize(filename)
-
-        if q_tokens and f_tokens:
-            overlap = len(q_tokens & f_tokens) / max(len(q_tokens), len(f_tokens))
-            score = max(score, overlap)
-
-        best = max(best, score)
-
-    path_norm = canon(path)
-
-    # Preferimos logos argentinos para canales argentinos y variantes
-    # World-Latin-America/International para señales regionales.
-    if "argentina" in path_norm:
-        best += 0.08
-    elif "world latin america" in path_norm:
-        best += 0.06
-    elif "international" in path_norm:
-        best += 0.04
-
-    return min(1.0, best)
-
-
-def find_tv_logo(
-    name: str,
-    tvg_id: str,
-    paths: list[str],
-) -> Optional[str]:
-    if not paths:
-        return None
-
-    ranked = sorted(
-        (
-            (tv_logo_name_score(name, tvg_id, path), path)
-            for path in paths
-        ),
-        reverse=True,
+    path.write_bytes(
+        text.replace("\n", "\r\n").encode("utf-8")
     )
 
-    if not ranked or ranked[0][0] < TV_LOGOS_MIN_SCORE:
-        return None
 
-    return TV_LOGOS_RAW + ranked[0][1]
+def parse_entries(lines: list[str]) -> list[ChannelEntry]:
+    entries: list[ChannelEntry] = []
+    pending_index: Optional[int] = None
+    pending_extinf: Optional[str] = None
+
+    for index, line in enumerate(lines):
+        if line.startswith("#EXTINF:"):
+            pending_index = index
+            pending_extinf = line
+            continue
+
+        if (
+            pending_extinf is not None
+            and line.startswith(("http://", "https://"))
+        ):
+            tvg_id = extract_attr(pending_extinf, "tvg-id")
+            group = extract_attr(pending_extinf, "group-title")
+            name = visible_name(pending_extinf)
+            current_logo = extract_attr(pending_extinf, "tvg-logo")
+
+            entries.append(
+                ChannelEntry(
+                    index=pending_index if pending_index is not None else index,
+                    extinf=pending_extinf,
+                    url=line,
+                    tvg_id=tvg_id,
+                    name=name,
+                    group=group,
+                    current_logo=current_logo,
+                )
+            )
+
+            pending_index = None
+            pending_extinf = None
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        pending_index = None
+        pending_extinf = None
+
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def session_headers(accept: str = "*/*") -> dict[str, str]:
+    return {
+        "User-Agent": UA,
+        "Accept": accept,
+        "Cache-Control": "no-cache",
+    }
+
+
+def get_json(session: requests.Session, url: str) -> Any:
+    response = session.get(
+        url,
+        timeout=SOURCE_TIMEOUT,
+        headers=session_headers("application/json"),
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_bytes(session: requests.Session, url: str) -> bytes:
+    response = session.get(
+        url,
+        timeout=SOURCE_TIMEOUT,
+        headers=session_headers(
+            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        ),
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    if len(response.content) > MAX_IMAGE_BYTES:
+        raise RuntimeError("imagen demasiado grande")
+
+    return response.content
 
 
 # ---------------------------------------------------------------------------
 # IPTVP-ORG
 # ---------------------------------------------------------------------------
 
-def download_json(session: requests.Session, url: str) -> Any:
-    r = session.get(
-        url,
-        timeout=SOURCE_TIMEOUT,
-        headers={
-            "User-Agent": UA,
-            "Accept": "application/json",
-        },
-    )
-    r.raise_for_status()
-    return r.json()
-
-
 def build_iptv_org_indexes(
     session: requests.Session,
 ) -> tuple[dict[str, list[dict]], list[dict]]:
-    """
-    Descarga:
-      - channels.json
-      - logos.json
-
-    Devuelve:
-      channel_index: channel id -> lista de logos
-      channels: lista completa de canales para fuzzy matching
-    """
     print("[+] Descargando channels.json de iptv-org...")
-    channels = download_json(session, IPTV_ORG_CHANNELS)
+    channels = get_json(session, IPTV_ORG_CHANNELS)
 
     print("[+] Descargando logos.json de iptv-org...")
-    logos = download_json(session, IPTV_ORG_LOGOS)
+    logos = get_json(session, IPTV_ORG_LOGOS)
 
     if not isinstance(channels, list):
-        raise RuntimeError("channels.json no devolvio una lista.")
-
+        raise RuntimeError("channels.json no devolvio una lista")
     if not isinstance(logos, list):
-        raise RuntimeError("logos.json no devolvio una lista.")
+        raise RuntimeError("logos.json no devolvio una lista")
 
-    channel_index: dict[str, list[dict]] = {}
+    index: dict[str, list[dict]] = {}
 
     for item in logos:
         if not isinstance(item, dict):
             continue
 
         channel = str(item.get("channel", "")).strip()
-        if not channel:
-            continue
+        if channel:
+            index.setdefault(channel, []).append(item)
 
-        channel_index.setdefault(channel, []).append(item)
+    return index, [
+        item for item in channels
+        if isinstance(item, dict)
+    ]
 
-    return channel_index, [x for x in channels if isinstance(x, dict)]
 
-
-def logo_format_rank(item: dict) -> int:
+def logo_rank(item: dict, preferred_feed: str = "") -> tuple:
     fmt = str(item.get("format", "")).upper()
-    return 3 if fmt in RASTER_FORMATS else 0
+    raster = 1 if fmt in RASTER_FORMATS else 0
 
-
-def logo_visibility_score(item: dict) -> int:
-    """
-    Prioriza variantes que suelen verse mejor sobre interfaces oscuras.
-    iptv-org publica tags como "white", "horizontal", etc.
-    """
     tags = {
-        str(x).strip().lower()
-        for x in (item.get("tags") or [])
-        if x
+        str(tag).strip().lower()
+        for tag in (item.get("tags") or [])
+        if tag
     }
 
-    score = 0
-
+    visible = 0
     if "white" in tags or "light" in tags:
-        score += 35
-
+        visible += 30
     if "horizontal" in tags:
-        score += 8
-
+        visible += 8
     if "black" in tags or "dark" in tags:
-        score -= 25
+        visible -= 25
 
-    if "transparent" in tags:
-        score -= 3
+    feed = str(item.get("feed") or "").strip().lower()
+    feed_match = 1 if preferred_feed and feed == preferred_feed.lower() else 0
+    in_use = 1 if item.get("in_use") is True else 0
+
+    width = int(item.get("width") or 0)
+    height = int(item.get("height") or 0)
+
+    return (
+        raster,
+        visible,
+        feed_match,
+        in_use,
+        width,
+        height,
+    )
+
+
+def choose_iptv_logo(
+    tvg_id: str,
+    channel_index: dict[str, list[dict]],
+) -> list[LogoCandidate]:
+    if not tvg_id:
+        return []
+
+    base = tvg_id.split("@", 1)[0].strip()
+    feed = tvg_id.split("@", 1)[1].strip() if "@" in tvg_id else ""
+
+    candidates: list[LogoCandidate] = []
+
+    for channel_id in (tvg_id, base):
+        items = channel_index.get(channel_id, [])
+        items = sorted(
+            items,
+            key=lambda item: logo_rank(item, feed),
+            reverse=True,
+        )
+
+        for item in items[:5]:
+            url = str(item.get("url", "")).strip()
+            if not url.startswith("https://"):
+                continue
+
+            fmt = str(item.get("format", "")).upper()
+            score = 1.0 if fmt in RASTER_FORMATS else 0.97
+
+            tags = " ".join(
+                str(x) for x in (item.get("tags") or [])
+            )
+            score += region_score(f"{channel_id} {feed} {tags}")
+
+            candidates.append(
+                LogoCandidate(
+                    url=url,
+                    source="iptv-org",
+                    match=min(1.0, score),
+                    reason=f"match exacto tvg-id={channel_id}",
+                    feed=feed,
+                )
+            )
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# GITHUB LOGO REPOSITORIES
+# ---------------------------------------------------------------------------
+
+def build_github_logo_index(
+    session: requests.Session,
+) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+
+    for repo, branch, source in GITHUB_TREE_SOURCES:
+        url = (
+            f"https://api.github.com/repos/{repo}"
+            f"/git/trees/{branch}?recursive=1"
+        )
+
+        try:
+            data = get_json(session, url)
+        except Exception as exc:
+            print(
+                f"[!] No se pudo indexar {repo}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        tree = data.get("tree", [])
+        paths: list[str] = []
+
+        if isinstance(tree, list):
+            for item in tree:
+                if not isinstance(item, dict):
+                    continue
+
+                if item.get("type") != "blob":
+                    continue
+
+                path = str(item.get("path", ""))
+                if path.lower().endswith((
+                    ".png", ".jpg", ".jpeg", ".webp"
+                )):
+                    paths.append(path)
+
+        result[source] = paths
+        print(f"[+] {source}: {len(paths)} logos raster indexados")
+
+    return result
+
+
+def github_path_score(
+    name: str,
+    tvg_id: str,
+    path: str,
+) -> float:
+    # Solo comparamos con el nombre del archivo y una parte de la ruta.
+    filename = Path(path).stem
+    score = name_similarity(name, filename)
+
+    text = canon(path)
+    score = min(
+        1.0,
+        score + region_score(text),
+    )
+
+    query_tokens = tokenize(name)
+    path_tokens = tokenize(path)
+
+    if query_tokens and path_tokens:
+        overlap = len(query_tokens & path_tokens) / max(
+            len(query_tokens),
+            len(path_tokens),
+        )
+        score = max(score, overlap)
+
+    # Ayuda a separar variantes argentinas de variantes internacionales.
+    if ".ar" in canon(tvg_id):
+        if "argentina" in text:
+            score = min(1.0, score + 0.08)
 
     return score
 
 
-def choose_logo(
-    items: list[dict],
-    preferred_feed: str = "",
-) -> Optional[dict]:
-    if not items:
-        return None
+def github_logo_candidates(
+    name: str,
+    tvg_id: str,
+    indexes: dict[str, list[str]],
+) -> list[LogoCandidate]:
+    result: list[LogoCandidate] = []
 
-    usable = [
-        x for x in items
-        if isinstance(x, dict)
-        and str(x.get("url", "")).startswith("https://")
-    ]
+    source_priority = {
+        "tv-logo": 100,
+        "fourqui": 96,
+        "logo-tv": 92,
+        "hmlendea": 88,
+    }
 
-    if not usable:
-        return None
+    raw_base = {
+        "tv-logo": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/",
+        "fourqui": "https://raw.githubusercontent.com/Fourqui/tv/main/",
+        "logo-tv": "https://raw.githubusercontent.com/logo-tv/tv-logos/main/",
+        "hmlendea": "https://raw.githubusercontent.com/hmlendea/tv-logos/master/",
+    }
 
-    def rank(item: dict) -> tuple[int, int, int, int, int]:
-        fmt_rank = logo_format_rank(item)
-        visibility = logo_visibility_score(item)
-
-        feed_match = 1 if (
-            preferred_feed
-            and str(item.get("feed") or "").strip().lower() == preferred_feed.lower()
-        ) else 0
-
-        in_use = 1 if item.get("in_use") is True else 0
-
-        width = int(item.get("width") or 0)
-        height = int(item.get("height") or 0)
-
-        # Preferimos tamaños razonables para clientes IPTV. Evitamos logos
-        # gigantes si existe una variante equivalente más pequeña.
-        size_score = 1 if 150 <= max(width, height) <= 1600 else 0
-
-        return (
-            fmt_rank,
-            visibility,
-            feed_match * 30 + in_use * 20 + size_score * 5,
-            width,
-            height,
+    for source, paths in indexes.items():
+        ranked = sorted(
+            (
+                (
+                    github_path_score(name, tvg_id, path),
+                    path,
+                )
+                for path in paths
+            ),
+            reverse=True,
         )
 
-    # IMPORTANTE:
-    # - primero raster (PNG/JPEG/WebP/...)
-    # - después visibilidad
-    # - después feed/in_use
-    # - SVG queda como última opción y será rasterizado si es de Wikimedia.
-    usable.sort(key=rank, reverse=True)
+        for score, path in ranked[:8]:
+            if score < 0.48:
+                continue
 
-    for item in usable:
-        if logo_format_rank(item) > 0:
-            return item
+            result.append(
+                LogoCandidate(
+                    url=raw_base[source] + quote_path(path),
+                    source=source,
+                    match=min(1.0, score),
+                    reason=f"coincidencia en {source}: {path}",
+                )
+            )
 
-    # Si no existe una versión raster, devolvemos la mejor vectorial.
-    # El llamador intentará obtener un thumbnail PNG/JPEG de Wikimedia.
-    return usable[0]
+    result.sort(
+        key=lambda item: (
+            item.match,
+            source_priority.get(item.source, 0),
+        ),
+        reverse=True,
+    )
 
-
-def wikimedia_raster_url(
-    session: requests.Session,
-    url: str,
-) -> Optional[str]:
-    """
-    Para un logo SVG alojado en Wikimedia Commons obtiene un thumbnail
-    rasterizado mediante la API de Wikimedia. Así evitamos entregar SVG
-    directamente a reproductores IPTV con soporte limitado.
-    """
-    if "upload.wikimedia.org/" not in url:
-        return None
-
-    try:
-        filename = url.split("/")[-1].split("?", 1)[0]
-        if not filename:
-            return None
-
-        params = {
-            "action": "query",
-            "titles": f"File:{filename}",
-            "prop": "imageinfo",
-            "iiprop": "url|mime|size",
-            "iiurlwidth": LOGO_THUMB_WIDTH,
-            "format": "json",
-            "formatversion": "2",
-        }
-
-        r = _wikimedia_get(
-            session,
-            COMMONS_API,
-            params=params,
-            accept="application/json",
-        )
-        r.raise_for_status()
-
-        data = r.json()
-        pages = data.get("query", {}).get("pages", [])
-        if not isinstance(pages, list) or not pages:
-            return None
-
-        info = pages[0].get("imageinfo") or []
-        if not info:
-            return None
-
-        image = info[0]
-        thumb = str(image.get("thumburl") or "")
-        if thumb.startswith("https://"):
-            return thumb
-
-    except (requests.RequestException, ValueError):
-        return None
-
-    return None
+    return result[:12]
 
 
-def is_local_logo_ref(value: str, logo_dir: Path) -> bool:
-    if not value:
-        return False
-
-    normalized = value.replace("\\", "/").strip()
-    if normalized.startswith(("http://", "https://")):
-        return False
-
-    if normalized.startswith("./"):
-        normalized = normalized[2:]
-
-    logo_prefix = logo_dir.as_posix().rstrip("/") + "/"
-    return normalized.startswith(logo_prefix) or (
-        Path(normalized).parent.as_posix() == logo_dir.as_posix()
+def quote_path(path: str) -> str:
+    return "/".join(
+        quote_plus(part).replace("+", "%20")
+        for part in path.split("/")
     )
 
 
-def image_slug(name: str, tvg_id: str) -> str:
-    base = canon(tvg_id) or canon(name) or "channel"
-    base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
-    digest = hashlib.sha1(
-        f"{tvg_id}|{name}".encode("utf-8")
-    ).hexdigest()[:8]
-    return f"{base[:70]}-{digest}.png"
+# ---------------------------------------------------------------------------
+# WIKIMEDIA
+# ---------------------------------------------------------------------------
 
-
-def _wikimedia_get(
+def wikimedia_search(
     session: requests.Session,
-    url: str,
-    *,
-    params: Optional[dict] = None,
-    accept: str = "*/*",
-) -> requests.Response:
-    """
-    Solicitud serializada y con backoff para evitar respuestas HTTP 429 de
-    Wikimedia cuando se procesan muchos logos seguidos.
-    """
-    global WIKIMEDIA_LAST_REQUEST
+    name: str,
+    premium: bool,
+) -> list[LogoCandidate]:
+    extra = " Latin America" if premium else " Argentina"
+    query = f'"{name}" television channel logo{extra}'
 
-    last_error = None
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",
+        "gsrlimit": "12",
+        "prop": "imageinfo",
+        "iiprop": "url|mime|size",
+        "iiurlwidth": LOGO_THUMB_WIDTH,
+        "format": "json",
+        "formatversion": "2",
+    }
 
-    for attempt in range(WIKIMEDIA_MAX_RETRIES + 1):
-        with WIKIMEDIA_LOCK:
-            now = time.monotonic()
-            wait = WIKIMEDIA_MIN_INTERVAL - (now - WIKIMEDIA_LAST_REQUEST)
-            if wait > 0:
-                time.sleep(wait)
+    try:
+        response = session.get(
+            COMMONS_API,
+            params=params,
+            timeout=SEARCH_TIMEOUT,
+            headers=session_headers("application/json"),
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return []
 
-            response = session.get(
-                url,
-                params=params,
-                timeout=COMMONS_TIMEOUT if "wikimedia" in url else SOURCE_TIMEOUT,
-                headers={
-                    "User-Agent": UA,
-                    "Accept": accept,
-                },
-                allow_redirects=True,
+    pages = data.get("query", {}).get("pages", [])
+    if not isinstance(pages, list):
+        return []
+
+    result: list[LogoCandidate] = []
+
+    for page in pages:
+        title = str(page.get("title", ""))
+        info = page.get("imageinfo") or []
+
+        if not info:
+            continue
+
+        image = info[0]
+        url = str(
+            image.get("thumburl")
+            or image.get("url")
+            or ""
+        )
+
+        if not url.startswith("https://"):
+            continue
+
+        title_norm = canon(title)
+        score = name_similarity(name, title)
+
+        if "logo" in title_norm or "wordmark" in title_norm:
+            score += 0.08
+
+        result.append(
+            LogoCandidate(
+                url=url,
+                source="Wikimedia Commons",
+                match=min(1.0, score),
+                reason=f"Wikimedia: {title}",
             )
-            WIKIMEDIA_LAST_REQUEST = time.monotonic()
-
-        if response.status_code != 429:
-            return response
-
-        retry_after = response.headers.get("Retry-After", "")
-        try:
-            delay = max(2.0, float(retry_after))
-        except ValueError:
-            delay = min(30.0, 2.0 ** attempt)
-
-        response.close()
-        last_error = RuntimeError(
-            f"HTTP 429 de Wikimedia; reintento {attempt + 1}/{WIKIMEDIA_MAX_RETRIES}"
         )
-        time.sleep(delay)
 
-    raise last_error or RuntimeError("Wikimedia devolvio HTTP 429")
+    result.sort(key=lambda item: item.match, reverse=True)
+    return result[:8]
 
 
-def download_logo_bytes(session: requests.Session, url: str) -> bytes:
-    is_wikimedia = "wikimedia.org/" in url.lower()
+# ---------------------------------------------------------------------------
+# GOOGLE / BING IMAGE SEARCH
+# ---------------------------------------------------------------------------
 
-    if is_wikimedia:
-        r = _wikimedia_get(
-            session,
-            url,
-            accept="image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        )
-    else:
-        r = session.get(
-            url,
-            timeout=SOURCE_TIMEOUT,
-            headers={
-                "User-Agent": UA,
-                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+def decode_escaped_url(value: str) -> str:
+    value = html.unescape(value)
+    value = value.replace("\\/", "/")
+    value = value.replace('\\"', '"')
+
+    try:
+        value = bytes(value, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        pass
+
+    return value
+
+
+def bing_image_search(
+    session: requests.Session,
+    name: str,
+    premium: bool,
+) -> list[LogoCandidate]:
+    region = "Latin America" if premium else "Argentina"
+    query = f"{name} TV channel logo {region}"
+
+    try:
+        response = session.get(
+            BING_IMAGES_URL,
+            params={
+                "q": query,
+                "form": "HDRSC2",
+                "first": "1",
             },
-            allow_redirects=True,
+            timeout=SEARCH_TIMEOUT,
+            headers=session_headers("text/html,application/xhtml+xml"),
+        )
+        response.raise_for_status()
+        source = html.unescape(response.text)
+    except requests.RequestException:
+        return []
+
+    urls: list[str] = []
+
+    # Bing coloca la metadata de cada resultado en atributos "m".
+    for match in re.finditer(
+        r'class=["\'][^"\']*iusc[^"\']*["\'][^>]*\bm=["\']([^"\']+)',
+        source,
+        flags=re.IGNORECASE,
+    ):
+        raw = match.group(1)
+
+        try:
+            metadata = json.loads(
+                html.unescape(raw.replace("&quot;", '"'))
+            )
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        murl = str(metadata.get("murl", "")).strip()
+        if murl.startswith(("http://", "https://")):
+            urls.append(murl)
+
+    # Fallback para cambios de HTML.
+    if not urls:
+        for match in re.findall(
+            r'"murl":"(https?://[^"]+)"',
+            source,
+            flags=re.IGNORECASE,
+        ):
+            urls.append(decode_escaped_url(match))
+
+    result: list[LogoCandidate] = []
+
+    for url in unique(urls)[:10]:
+        path_text = unquote(url)
+        score = name_similarity(name, path_text)
+        result.append(
+            LogoCandidate(
+                url=url,
+                source="Bing Images",
+                match=min(1.0, score + 0.45),
+                reason=f"Bing Images: {query}",
+            )
         )
 
-    r.raise_for_status()
-
-    if len(r.content) > 10 * 1024 * 1024:
-        raise RuntimeError("logo demasiado grande (>10 MB)")
-
-    return r.content
+    return result[:8]
 
 
-def rasterize_logo(data: bytes, output_path: Path) -> tuple[bool, bool]:
+def google_image_search(
+    session: requests.Session,
+    name: str,
+    premium: bool,
+) -> list[LogoCandidate]:
+    region = "Latin America" if premium else "Argentina"
+    query = f"{name} TV channel logo {region}"
+
+    try:
+        response = session.get(
+            GOOGLE_IMAGES_URL,
+            params={
+                "tbm": "isch",
+                "q": query,
+            },
+            timeout=SEARCH_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                ),
+                "Accept-Language": "es-AR,es;q=0.9,en;q=0.7",
+            },
+        )
+        response.raise_for_status()
+        source = response.text
+    except requests.RequestException:
+        return []
+
+    urls: list[str] = []
+
+    # Google Images suele incluir la URL original como "ou".
+    for match in re.findall(
+        r'"ou":"(https?://[^"]+)"',
+        source,
+        flags=re.IGNORECASE,
+    ):
+        urls.append(decode_escaped_url(match))
+
+    # Algunos diseños usan "original".
+    for match in re.findall(
+        r'"original":"(https?://[^"]+)"',
+        source,
+        flags=re.IGNORECASE,
+    ):
+        urls.append(decode_escaped_url(match))
+
+    result: list[LogoCandidate] = []
+
+    for url in unique(urls)[:12]:
+        path_text = unquote(url)
+        score = name_similarity(name, path_text)
+
+        result.append(
+            LogoCandidate(
+                url=url,
+                source="Google Images",
+                match=min(1.0, score + 0.43),
+                reason=f"Google Images: {query}",
+            )
+        )
+
+    return result[:8]
+
+
+# ---------------------------------------------------------------------------
+# IMAGEN / PNG
+# ---------------------------------------------------------------------------
+
+def rasterize_image(
+    data: bytes,
+    output_path: Path,
+) -> bool:
     with Image.open(io.BytesIO(data)) as source:
         image = source.convert("RGBA")
 
@@ -659,6 +878,10 @@ def rasterize_logo(data: bytes, output_path: Path) -> tuple[bool, bool]:
             Image.Resampling.LANCZOS,
         )
 
+        if image.width < 40 or image.height < 20:
+            raise RuntimeError("imagen demasiado pequeña para ser un logo")
+
+        # Añadimos margen transparente.
         padded = Image.new(
             "RGBA",
             (
@@ -667,390 +890,275 @@ def rasterize_logo(data: bytes, output_path: Path) -> tuple[bool, bool]:
             ),
             (0, 0, 0, 0),
         )
-        padded.alpha_composite(image, (LOGO_PADDING, LOGO_PADDING))
+        padded.alpha_composite(
+            image,
+            (LOGO_PADDING, LOGO_PADDING),
+        )
         image = padded
 
-        visible_alpha = image.getchannel("A")
-        gray = image.convert("RGB").convert("L")
-
-        pixels = [
-            gray.getpixel((x, y))
-            for y in range(image.height)
-            for x in range(image.width)
-            if visible_alpha.getpixel((x, y)) > 32
-        ]
-
-        white_background = False
-        if pixels:
-            mean_luma = sum(pixels) / len(pixels)
-            dark_ratio = sum(1 for value in pixels if value < 85) / len(pixels)
-
-            if mean_luma < 115 and dark_ratio >= 0.45:
-                white_background = True
-
-        if white_background:
-            background = Image.new(
-                "RGBA",
-                image.size,
-                (255, 255, 255, 255),
-            )
-            background.alpha_composite(image)
-            image = background
-
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(output_path, format="PNG", optimize=True)
 
-    return True, white_background
+        # Siempre PNG real.
+        image.save(
+            output_path,
+            format="PNG",
+            optimize=True,
+        )
+
+    return True
 
 
-def localize_logo(
-    session: requests.Session,
-    logo: LogoResult,
-    name: str,
-    tvg_id: str,
-    logo_dir: Path,
-    tv_logo_paths: list[str],
-) -> tuple[Optional[Path], bool]:
-    if not logo.url:
-        return None, False
+def detect_dark_logo_on_transparent(path: Path) -> bool:
+    """
+    Detecta logos predominantemente oscuros sobre transparencia.
+    Estos pueden resultar invisibles en clientes IPTV con fondo oscuro.
 
-    def save_from_url(source_url: str) -> tuple[Optional[Path], bool]:
-        data = download_logo_bytes(session, source_url)
-        target = logo_dir / image_slug(name, tvg_id)
-        ok, white_bg = rasterize_logo(data, target)
-        if ok:
-            return target, white_bg
-        return None, False
+    La correccion se aplica solo cuando:
+    - hay suficiente contenido visible;
+    - la mayoria de los pixels visibles son oscuros.
+    """
+    with Image.open(path) as source:
+        image = source.convert("RGBA")
+        alpha = image.getchannel("A")
+        visible = []
 
-    source_url = logo.url
+        for y in range(0, image.height, 4):
+            for x in range(0, image.width, 4):
+                a = alpha.getpixel((x, y))
+                if a <= 32:
+                    continue
 
-    # Para Wikimedia intentamos PRIMERO el repositorio tv-logo/tv-logos.
-    # Esto evita depender de Wikimedia para los logos que ya tienen una
-    # alternativa PNG optimizada para fondos oscuros.
-    if "wikimedia.org/" in source_url.lower():
-        alt_url = find_tv_logo(name, tvg_id, tv_logo_paths)
-        if alt_url:
-            try:
-                print(f"[+] Fallback preferido tv-logo/tv-logos: {name}")
-                return save_from_url(alt_url)
-            except Exception as exc:
-                print(
-                    f"[!] Fallback tv-logo fallo para {name}: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
+                r, g, b, _ = image.getpixel((x, y))
+                luminance = (
+                    0.2126 * r
+                    + 0.7152 * g
+                    + 0.0722 * b
                 )
+                visible.append(luminance)
 
-    # Si el logo existente es un SVG de Wikimedia, primero pedimos un
-    # thumbnail rasterizado. Pillow no necesita soportar SVG directamente.
-    if source_url.lower().split("?", 1)[0].endswith(".svg"):
-        raster = wikimedia_raster_url(session, source_url)
-        if raster:
-            source_url = raster
+        if len(visible) < 20:
+            return False
 
+        mean = sum(visible) / len(visible)
+        dark = sum(1 for value in visible if value < 85) / len(visible)
+
+        return mean < 115 and dark >= 0.45
+
+
+def apply_white_background(path: Path) -> None:
+    with Image.open(path) as source:
+        image = source.convert("RGBA")
+
+        background = Image.new(
+            "RGBA",
+            image.size,
+            (255, 255, 255, 255),
+        )
+        background.alpha_composite(image)
+
+        background.save(
+            path,
+            format="PNG",
+            optimize=True,
+        )
+
+
+def validate_png(path: Path) -> tuple[bool, int, int]:
     try:
-        return save_from_url(source_url)
-    except Exception as exc:
-        print(
-            f"[!] Fuente primaria no disponible para {name}: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
+        with Image.open(path) as image:
+            image.verify()
+
+        with Image.open(path) as image:
+            return True, image.width, image.height
+    except Exception:
+        return False, 0, 0
+
+
+# ---------------------------------------------------------------------------
+# CANDIDATOS
+# ---------------------------------------------------------------------------
+
+def unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for value in items:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+
+    return result
+
+
+def current_logo_candidate(entry: ChannelEntry) -> list[LogoCandidate]:
+    if not entry.current_logo:
+        return []
+
+    return [
+        LogoCandidate(
+            url=entry.current_logo,
+            source="m3u",
+            match=0.85,
+            reason="logo existente en la M3U",
         )
-
-    # Segundo fallback independiente de Wikimedia: tv-logo/tv-logos.
-    alt_url = find_tv_logo(name, tvg_id, tv_logo_paths)
-    if alt_url:
-        try:
-            print(f"[+] Fallback tv-logo/tv-logos: {name}")
-            return save_from_url(alt_url)
-        except Exception as exc:
-            print(
-                f"[!] Fallback tv-logo fallo para {name}: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-
-    return None, False
+    ]
 
 
-def make_raster_result(
-    session: requests.Session,
-    item: dict,
-    source: str,
-    confidence: int,
-    reason: str,
-) -> Optional[LogoResult]:
-    url = str(item.get("url", "")).strip()
-    fmt = str(item.get("format", "")).upper()
+def candidate_score(
+    candidate: LogoCandidate,
+    image_width: int,
+    image_height: int,
+) -> float:
+    source_base = SOURCE_PRIORITY.get(candidate.source, 50) / 100.0
 
-    if not url.startswith("https://"):
-        return None
+    size_bonus = 0.0
+    largest = max(image_width, image_height)
+    if largest >= 300:
+        size_bonus = 0.05
+    elif largest >= 150:
+        size_bonus = 0.02
 
-    # Los formatos raster se usan directamente.
-    if fmt in RASTER_FORMATS:
-        return LogoResult(
-            url=url,
-            source=source,
-            confidence=confidence,
-            reason=reason,
-        )
+    ratio = image_width / max(image_height, 1)
+    ratio_bonus = 0.02 if 1.1 <= ratio <= 5.5 else 0.0
 
-    # SVG: solo lo aceptamos si Wikimedia puede entregarnos un thumbnail
-    # rasterizado.
-    if fmt == "SVG" or url.lower().split("?", 1)[0].endswith(".svg"):
-        raster = wikimedia_raster_url(session, url)
-        if raster:
-            return LogoResult(
-                url=raster,
-                source=f"{source}:rasterizado",
-                confidence=confidence,
-                reason=f"{reason}; thumbnail PNG/JPEG generado por Wikimedia",
-            )
-        return None
-
-    return None
+    return (
+        candidate.match * 0.60
+        + source_base * 0.32
+        + size_bonus
+        + ratio_bonus
+    )
 
 
-
-def exact_iptv_org_logo(
-    tvg_id: str,
+def find_best_local_logo(
+    entry: ChannelEntry,
     channel_index: dict[str, list[dict]],
+    github_indexes: dict[str, list[str]],
     session: requests.Session,
-) -> Optional[LogoResult]:
-    if not tvg_id:
-        return None
+    allow_web_search: bool,
+    candidate_limit: int,
+) -> LogoCandidate | None:
+    premium = canon(entry.group) == "premium latinoamerica"
 
-    base = tvg_id_base(tvg_id)
-    feed = tvg_id.split("@", 1)[1].strip() if "@" in tvg_id else ""
+    candidates: list[LogoCandidate] = []
 
-    for channel_id in (tvg_id, base):
-        item = choose_logo(channel_index.get(channel_id, []), feed)
-        if item:
-            result = make_raster_result(
-                session,
-                item,
-                "iptv-org:exact",
-                100,
-                f"match exacto tvg-id={channel_id}",
-            )
-            if result:
-                return result
+    candidates.extend(
+        choose_iptv_logo(
+            entry.tvg_id,
+            channel_index,
+        )
+    )
+    candidates.extend(
+        github_logo_candidates(
+            entry.name,
+            entry.tvg_id,
+            github_indexes,
+        )
+    )
+    candidates.extend(
+        current_logo_candidate(entry)
+    )
 
-    return None
+    # Ordenamos y probamos primero las fuentes estructuradas.
+    candidates.sort(
+        key=lambda item: (
+            SOURCE_PRIORITY.get(item.source, 50),
+            item.match,
+        ),
+        reverse=True,
+    )
 
-
-
-def fuzzy_iptv_org_logo(
-    name: str,
-    tvg_id: str,
-    channels: list[dict],
-    channel_index: dict[str, list[dict]],
-    premium: bool,
-    session: requests.Session,
-) -> Optional[LogoResult]:
-    query_names = [name]
-
-    base = tvg_id_base(tvg_id)
-    if base:
-        query_names.append(base)
-
-    best: tuple[float, Optional[dict]] = (0.0, None)
-
-    for channel in channels:
-        channel_id = str(channel.get("id", "")).strip()
-        if not channel_id:
-            continue
-
-        cand_name = str(channel.get("name", "")).strip()
-        alt_names = channel.get("alt_names") or []
-
-        candidates = [cand_name]
-        if isinstance(alt_names, list):
-            candidates.extend(str(x) for x in alt_names if x)
-
-        similarity = max(
-            name_similarity(q, c)
-            for q in query_names
-            for c in candidates
+    if allow_web_search and not candidates:
+        candidates.extend(
+            wikimedia_search(session, entry.name, premium)
+        )
+        candidates.extend(
+            bing_image_search(session, entry.name, premium)
+        )
+        candidates.extend(
+            google_image_search(session, entry.name, premium)
         )
 
-        regional_bonus = 0.0
-        if premium:
-            region_text = " ".join(
-                [channel_id, cand_name, *[str(x) for x in alt_names]]
-                if isinstance(alt_names, list)
-                else [channel_id, cand_name]
-            )
-            if region_score(region_text):
-                regional_bonus = 0.08
-
-        total = min(1.0, similarity + regional_bonus)
-
-        if total > best[0]:
-            best = (total, channel)
-
-    confidence = int(best[0] * 100)
-    channel = best[1]
-
-    if not channel or confidence < (88 if premium else 84):
-        return None
-
-    channel_id = str(channel.get("id", "")).strip()
-    logo = choose_logo(channel_index.get(channel_id, []))
-    if not logo:
-        return None
-
-    return make_raster_result(
-        session,
-        logo,
-        "iptv-org:name",
-        confidence,
-        f"match por nombre -> {channel_id}",
-    )
+    # Aunque haya candidatos estructurados, si todos fallan al descargar,
+    # el llamador volvera a intentar las busquedas web.
+    return candidates[:candidate_limit][0] if candidates else None
 
 
-
-
-# ---------------------------------------------------------------------------
-# WIKIMEDIA COMMONS - FALLBACK WEB
-# ---------------------------------------------------------------------------
-
-def commons_logo_search(
-    session: requests.Session,
-    name: str,
-    premium: bool,
-) -> Optional[LogoResult]:
-    extra = " Latin America" if premium else " Argentina"
-    query = f'"{name}" television channel logo{extra}'
-
-    params = {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": query,
-        "gsrnamespace": "6",
-        "gsrlimit": "10",
-        "prop": "imageinfo",
-        "iiprop": "url|mime|size",
-        "iiurlwidth": LOGO_THUMB_WIDTH,
-        "format": "json",
-        "formatversion": "2",
-    }
-
-    try:
-        r = session.get(
-            COMMONS_API,
-            params=params,
-            timeout=COMMONS_TIMEOUT,
-            headers={
-                "User-Agent": UA,
-                "Accept": "application/json",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError):
-        return None
-
-    pages = data.get("query", {}).get("pages", [])
-    if not isinstance(pages, list):
-        return None
-
-    best: tuple[float, Optional[dict]] = (0.0, None)
-
-    for page in pages:
-        title = str(page.get("title", ""))
-        info = page.get("imageinfo") or []
-        if not info:
-            continue
-
-        image = info[0]
-        url = str(image.get("thumburl") or image.get("url") or "")
-        mime = str(image.get("thumbmime") or image.get("mime") or "").lower()
-
-        if not url.startswith("https://"):
-            continue
-
-        if url.lower().split("?", 1)[0].endswith(".svg"):
-            continue
-
-        if mime == "image/svg+xml":
-            continue
-
-        if mime and not mime.startswith("image/"):
-            continue
-
-        title_norm = canon(title)
-        if "logo" not in title_norm and "wordmark" not in title_norm:
-            continue
-
-        similarity = name_similarity(name, title)
-        if name_norm_contains(name, title):
-            similarity = max(similarity, 0.90)
-
-        if similarity > best[0]:
-            best = (similarity, {"url": url, "title": title})
-
-    if not best[1] or best[0] < 0.80:
-        return None
-
-    return LogoResult(
-        url=best[1]["url"],
-        source="Wikimedia Commons:raster",
-        confidence=int(best[0] * 100),
-        reason=f"busqueda web -> {best[1]['title']}",
-    )
-
-
-
-# ---------------------------------------------------------------------------
-# RESOLUCION POR CANAL
-# ---------------------------------------------------------------------------
-
-def is_premium_line(extinf: str) -> bool:
-    return canon(extract_attr(extinf, "group-title")) == "premium latinoamerica"
-
-
-def resolve_logo(
-    extinf: str,
+def all_candidates_for_entry(
+    entry: ChannelEntry,
     channel_index: dict[str, list[dict]],
-    channels: list[dict],
+    github_indexes: dict[str, list[str]],
     session: requests.Session,
-    web_fallback: bool,
-) -> LogoResult:
-    tvg_id = extract_attr(extinf, "tvg-id")
-    name = visible_name(extinf)
-    premium = is_premium_line(extinf)
+    web_search: bool,
+) -> list[LogoCandidate]:
+    premium = canon(entry.group) == "premium latinoamerica"
 
-    exact = exact_iptv_org_logo(
-        tvg_id,
-        channel_index,
-        session,
+    candidates: list[LogoCandidate] = []
+    candidates.extend(choose_iptv_logo(entry.tvg_id, channel_index))
+    candidates.extend(
+        github_logo_candidates(
+            entry.name,
+            entry.tvg_id,
+            github_indexes,
+        )
     )
-    if exact:
-        return exact
+    candidates.extend(current_logo_candidate(entry))
 
-    fuzzy = fuzzy_iptv_org_logo(
-        name,
-        tvg_id,
-        channels,
-        channel_index,
-        premium,
-        session,
-    )
-    if fuzzy:
-        return fuzzy
-
-    if web_fallback:
-        web = commons_logo_search(session, name, premium)
-        if web:
-            return web
-
-    return LogoResult(
-        source="NO ENCONTRADO",
-        confidence=0,
-        reason="No se encontro un logo raster compatible con suficiente confianza.",
+    candidates.sort(
+        key=lambda item: (
+            item.match,
+            SOURCE_PRIORITY.get(item.source, 50),
+        ),
+        reverse=True,
     )
 
+    if web_search:
+        # Las búsquedas web se hacen después de las fuentes estructuradas.
+        candidates.extend(
+            wikimedia_search(session, entry.name, premium)
+        )
+        candidates.extend(
+            bing_image_search(session, entry.name, premium)
+        )
+        candidates.extend(
+            google_image_search(session, entry.name, premium)
+        )
 
+    # Deduplicar por URL.
+    output: list[LogoCandidate] = []
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        if candidate.url in seen:
+            continue
+
+        seen.add(candidate.url)
+        output.append(candidate)
+
+    return output[:30]
+
+
+def save_candidate_image(
+    session: requests.Session,
+    candidate: LogoCandidate,
+    target: Path,
+) -> tuple[bool, int, int, bool]:
+    data = get_bytes(session, candidate.url)
+
+    # Primero se intenta con Pillow.
+    rasterize_image(data, target)
+
+    white_background = False
+
+    if detect_dark_logo_on_transparent(target):
+        apply_white_background(target)
+        white_background = True
+
+    ok, width, height = validate_png(target)
+
+    if not ok:
+        raise RuntimeError("PNG generado no valido")
+
+    return True, width, height, white_background
 
 
 # ---------------------------------------------------------------------------
@@ -1059,411 +1167,399 @@ def resolve_logo(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Completa tvg-logo de una M3U sin tocar canales ni URLs; prioriza imagenes raster compatibles (PNG/JPEG/WebP)."
+        description="Descarga logos PNG de todos los canales de una M3U."
     )
 
     parser.add_argument(
         "--input",
         default="masterlist_argentina_latino.m3u",
-        help="M3U de entrada",
     )
     parser.add_argument(
         "--output",
         default="masterlist_argentina_latino_logos.m3u",
-        help="M3U de salida",
     )
     parser.add_argument(
         "--report",
         default="masterlist_argentina_latino_logos_report.txt",
-        help="informe de logos",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="busquedas web simultaneas para fallbacks (default: 8)",
-    )
-    parser.add_argument(
-        "--refresh-existing",
-        action="store_true",
-        help="tambien permite reemplazar logos que ya existan",
-    )
-    parser.add_argument(
-        "--no-web-fallback",
-        action="store_true",
-        help="no usar Wikimedia Commons como busqueda web de respaldo",
     )
     parser.add_argument(
         "--logo-dir",
         default="logos",
-        help="carpeta donde se guardan los PNG normalizados",
     )
     parser.add_argument(
         "--logo-base-url",
         default="",
-        help="URL base publica para los PNG del directorio de logos",
+        help="URL base publica para los PNG locales",
     )
     parser.add_argument(
-        "--rasterize-existing",
+        "--clean-logo-dir",
         action="store_true",
-        help="tambien normaliza a PNG los logos que ya existen en la M3U",
+        help="elimina la carpeta logos antes de comenzar",
+    )
+    parser.add_argument(
+        "--no-web-search",
+        action="store_true",
+        help="no consultar Wikimedia/Bing/Google Images",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="descargas simultaneas de logos (default: 4)",
+    )
+    parser.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=12,
+        help="maximo de candidatos estructurados por canal",
     )
 
     args = parser.parse_args()
 
-    if args.workers < 1 or args.workers > 20:
-        parser.error("--workers debe estar entre 1 y 20")
+    if not (1 <= args.workers <= 12):
+        parser.error("--workers debe estar entre 1 y 12")
+
+    if not (2 <= args.candidate_limit <= 30):
+        parser.error("--candidate-limit debe estar entre 2 y 30")
 
     input_path = Path(args.input)
     output_path = Path(args.output)
     report_path = Path(args.report)
+    logo_dir = Path(args.logo_dir)
 
     if not input_path.exists():
-        print(f"[!] No existe la M3U de entrada: {input_path}", file=sys.stderr)
+        print(
+            f"[!] No existe la M3U: {input_path}",
+            file=sys.stderr,
+        )
         return 1
 
-    try:
-        lines = load_m3u(input_path)
-    except RuntimeError as exc:
-        print(f"[!] {exc}", file=sys.stderr)
+    if args.clean_logo_dir and logo_dir.exists():
+        print(f"[+] Limpiando carpeta {logo_dir}...")
+        shutil.rmtree(logo_dir)
+
+    lines = load_m3u(input_path)
+    entries = parse_entries(lines)
+
+    if not entries:
+        print("[!] No se encontraron entradas EXTINF.", file=sys.stderr)
         return 1
+
+    print()
+    print(f"[+] Entradas EXTINF: {len(entries)}")
 
     session = requests.Session()
 
     try:
         channel_index, channels = build_iptv_org_indexes(session)
     except Exception as exc:
-        print(f"[!] No se pudo obtener la informacion de logos: {exc}", file=sys.stderr)
+        print(
+            f"[!] No se pudo cargar iptv-org: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         session.close()
         return 1
 
-    print("[+] Descargando indice de tv-logo/tv-logos...")
-    tv_logo_paths = build_tv_logo_index(session)
-    print(f"[+] Logos PNG disponibles en tv-logo/tv-logos: {len(tv_logo_paths)}")
+    github_indexes = build_github_logo_index(session)
 
     # -----------------------------------------------------------------------
-    # Identificar entradas EXTINF y decidir cuales necesitan resolucion.
+    # Primero armamos el conjunto de candidatos. Las busquedas web se hacen
+    # por canal en paralelo despues de tener las fuentes estructuradas.
     # -----------------------------------------------------------------------
-    entries: list[tuple[int, str]] = []
+    web_search = not args.no_web_search
 
-    for i, line in enumerate(lines):
-        if line.startswith("#EXTINF:"):
-            entries.append((i, line))
+    candidate_map: dict[int, list[LogoCandidate]] = {}
 
-    total = len(entries)
-    already = 0
-    pending: list[tuple[int, str]] = []
-    existing_to_rasterize: list[tuple[int, str]] = []
+    def build_for_entry(
+        entry: ChannelEntry,
+    ) -> tuple[int, list[LogoCandidate]]:
+        local_session = requests.Session()
+        try:
+            candidates = all_candidates_for_entry(
+                entry,
+                channel_index,
+                github_indexes,
+                local_session,
+                web_search,
+            )
+            return entry.index, candidates
+        finally:
+            local_session.close()
 
-    logo_dir = Path(args.logo_dir)
+    print("[+] Buscando candidatos para los canales...")
 
-    for index, extinf in entries:
-        current_logo = extract_attr(extinf, "tvg-logo")
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.workers
+    ) as executor:
+        futures = [
+            executor.submit(build_for_entry, entry)
+            for entry in entries
+        ]
 
-        if current_logo and is_local_logo_ref(current_logo, logo_dir):
-            already += 1
-            continue
-
-        if current_logo and args.rasterize_existing:
-            existing_to_rasterize.append((index, extinf))
-            continue
-
-        if current_logo and not args.refresh_existing:
-            already += 1
-            continue
-
-        pending.append((index, extinf))
-
-    print()
-    print(f"[+] Entradas EXTINF: {total}")
-    print(f"[+] Con logo existente (preservado): {already}")
-    print(f"[+] A resolver: {len(pending)}")
-    print(f"[+] A normalizar a PNG: {len(existing_to_rasterize)}")
-    print()
+        for future in concurrent.futures.as_completed(futures):
+            index, candidates = future.result()
+            candidate_map[index] = candidates
 
     # -----------------------------------------------------------------------
-    # Primero intentamos resolver desde iptv-org localmente.
-    # El fallback web solo se ejecuta para los casos que no encuentran logo.
+    # Descargar y validar. Se hace con pocas conexiones simultaneas para no
+    # saturar hosts de logos.
     # -----------------------------------------------------------------------
     results: dict[int, LogoResult] = {}
+    counts: dict[str, int] = {}
+    failures: dict[int, list[str]] = {}
 
-    unresolved_after_iptv: list[tuple[int, str]] = []
-
-    for index, extinf in pending:
-        exact = exact_iptv_org_logo(
-            extract_attr(extinf, "tvg-id"),
-            channel_index,
-            session,
+    def process_entry(entry: ChannelEntry) -> tuple[int, LogoResult]:
+        candidates = candidate_map.get(entry.index, [])
+        target = logo_dir / image_slug(
+            entry.name,
+            entry.tvg_id,
         )
 
-        if exact:
-            results[index] = exact
-            continue
+        local_session = requests.Session()
 
-        fuzzy = fuzzy_iptv_org_logo(
-            visible_name(extinf),
-            extract_attr(extinf, "tvg-id"),
-            channels,
-            channel_index,
-            is_premium_line(extinf),
-            session,
-        )
+        try:
+            # Prioridad dinámica:
+            # match -> fuente -> tamaño.
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    item.match,
+                    SOURCE_PRIORITY.get(item.source, 50),
+                ),
+                reverse=True,
+            )
 
-        if fuzzy:
-            results[index] = fuzzy
-            continue
+            # Primera pasada: candidatos estructurados y logo actual.
+            tried: list[str] = []
 
-        unresolved_after_iptv.append((index, extinf))
+            for candidate in ordered[:args.candidate_limit]:
+                try:
+                    (
+                        ok,
+                        width,
+                        height,
+                        white_background,
+                    ) = save_candidate_image(
+                        local_session,
+                        candidate,
+                        target,
+                    )
 
-    print(f"[+] Resueltos con iptv-org: {len(results)}")
-    print(f"[+] Sin coincidencia en iptv-org: {len(unresolved_after_iptv)}")
+                    if not ok:
+                        continue
+
+                    score = candidate_score(
+                        candidate,
+                        width,
+                        height,
+                    )
+
+                    result = LogoResult(
+                        path=target,
+                        source=candidate.source,
+                        confidence=min(
+                            99,
+                            max(
+                                1,
+                                int(score * 100),
+                            ),
+                        ),
+                        reason=(
+                            f"{candidate.reason}; "
+                            f"{width}x{height}px"
+                        ),
+                        white_background=white_background,
+                    )
+
+                    return entry.index, result
+
+                except Exception as exc:
+                    tried.append(
+                        f"{candidate.source}: "
+                        f"{type(exc).__name__}"
+                    )
+
+            return entry.index, LogoResult(
+                source="NO ENCONTRADO",
+                confidence=0,
+                reason=(
+                    "Ninguna fuente produjo una imagen valida. "
+                    + "; ".join(tried[:8])
+                ),
+            )
+
+        finally:
+            local_session.close()
+
+    print("[+] Descargando y normalizando logos...")
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.workers
+    ) as executor:
+        futures = [
+            executor.submit(process_entry, entry)
+            for entry in entries
+        ]
+
+        for done, future in enumerate(
+            concurrent.futures.as_completed(futures),
+            start=1,
+        ):
+            index, result = future.result()
+            results[index] = result
+
+            state = "OK" if result.path else "FAIL"
+            print(
+                f"[{done:>3}/{len(entries)}] "
+                f"{state:<4} "
+                f"{entries[[x.index for x in entries].index(index)].name}"
+            )
 
     # -----------------------------------------------------------------------
-    # Fallback web con Commons.
+    # Aplicar referencias locales / URL publicas y generar informe.
     # -----------------------------------------------------------------------
-    if unresolved_after_iptv and not args.no_web_fallback:
-        def web_job(item: tuple[int, str]) -> tuple[int, LogoResult]:
-            index, extinf = item
-            local_session = requests.Session()
-            try:
-                result = commons_logo_search(
-                    local_session,
-                    visible_name(extinf),
-                    is_premium_line(extinf),
-                )
-                if result:
-                    return index, result
-                return index, LogoResult(
-                    source="NO ENCONTRADO",
-                    confidence=0,
-                    reason="No hubo resultado valido en Wikimedia Commons.",
-                )
-            finally:
-                local_session.close()
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.workers
-        ) as executor:
-            future_map = [
-                executor.submit(web_job, item)
-                for item in unresolved_after_iptv
-            ]
-
-            for future in concurrent.futures.as_completed(future_map):
-                index, result = future.result()
-                results[index] = result
-
-    # -----------------------------------------------------------------------
-    # Aplicar tvg-logo y generar PNG locales normalizados.
-    # -----------------------------------------------------------------------
-    added = 0
+    total = len(entries)
+    success = 0
     unresolved = 0
-    refreshed = 0
-    localized = 0
-    white_backgrounds = 0
-    localization_failures = 0
+    backgrounds = 0
 
     report_lines = [
         "Masterlist Argentina + Premium Latinoamerica - Logo Report",
         "=" * 72,
         f"M3U entrada: {input_path}",
         f"M3U salida: {output_path}",
-        f"Directorio de logos: {logo_dir}",
+        f"Directorio logos: {logo_dir}",
         "",
     ]
 
-    def public_logo_url(local_path: Path) -> str:
-        if args.logo_base_url:
-            return (
-                args.logo_base_url.rstrip("/")
-                + "/"
-                + local_path.name
-            )
-        return local_path.as_posix()
+    public_base = args.logo_base_url.rstrip("/")
 
-    for index, extinf in pending:
+    entry_by_index = {entry.index: entry for entry in entries}
+
+    for entry in entries:
         result = results.get(
-            index,
+            entry.index,
             LogoResult(
                 source="NO ENCONTRADO",
-                confidence=0,
-                reason="No se obtuvo resultado raster compatible.",
+                reason="Sin resultado.",
             ),
         )
 
-        name = visible_name(extinf)
-        tvg_id = extract_attr(extinf, "tvg-id")
-        old_logo = extract_attr(extinf, "tvg-logo")
-
-        if not result.url:
+        if not result.path:
             unresolved += 1
+
             report_lines.append(
-                f"❌ SIN LOGO | {name} | tvg-id={tvg_id}"
+                f"❌ SIN LOGO | {entry.name} | tvg-id={entry.tvg_id}"
             )
-            report_lines.append(f"   detalle={result.reason}")
+            report_lines.append(
+                f"   detalle={result.reason}"
+            )
             continue
 
-        local_path, white_bg = localize_logo(
-            session,
-            result,
-            name,
-            tvg_id,
-            logo_dir,
-            tv_logo_paths,
+        success += 1
+
+        if result.white_background:
+            backgrounds += 1
+
+        filename = result.path.name
+
+        if public_base:
+            logo_ref = f"{public_base}/{filename}"
+        else:
+            logo_ref = f"{logo_dir.as_posix()}/{filename}"
+
+        lines[entry.index] = set_attr(
+            lines[entry.index],
+            "tvg-logo",
+            logo_ref,
         )
 
-        if not local_path:
-            localization_failures += 1
-            unresolved += 1
-            report_lines.append(
-                f"❌ SIN PNG LOCAL | {name} | tvg-id={tvg_id}"
-            )
-            report_lines.append(f"   logo remoto={result.url}")
-            report_lines.append("   detalle=No se pudo descargar/convertir la imagen.")
-            continue
-
-        logo_url = public_logo_url(local_path)
-        lines[index] = set_attr(lines[index], "tvg-logo", logo_url)
-
-        if old_logo:
-            refreshed += 1
-            action = "ACTUALIZADO"
-        else:
-            added += 1
-            action = "AGREGADO"
-
-        localized += 1
-        if white_bg:
-            white_backgrounds += 1
-
         report_lines.append(
-            f"✅ {action} | {name} | tvg-id={tvg_id}"
+            f"✅ LOGO | {entry.name} | tvg-id={entry.tvg_id}"
         )
         report_lines.append(
             f"   fuente={result.source} | confianza={result.confidence}%"
         )
-        report_lines.append(f"   PNG={local_path.as_posix()}")
-        report_lines.append(f"   tvg-logo={logo_url}")
         report_lines.append(
-            f"   fondo_blanco={'SI' if white_bg else 'NO'}"
+            f"   PNG={result.path.as_posix()}"
         )
-        report_lines.append(f"   detalle={result.reason}")
-
-    for index, extinf in existing_to_rasterize:
-        name = visible_name(extinf)
-        tvg_id = extract_attr(extinf, "tvg-id")
-        source_url = extract_attr(extinf, "tvg-logo")
-
-        source_logo = LogoResult(
-            url=source_url,
-            source="logo existente",
-            confidence=100,
-            reason="Logo existente normalizado a PNG local.",
-        )
-
-        local_path, white_bg = localize_logo(
-            session,
-            source_logo,
-            name,
-            tvg_id,
-            logo_dir,
-        )
-
-        if not local_path:
-            localization_failures += 1
-            report_lines.append(
-                f"❌ NO NORMALIZADO | {name} | tvg-id={tvg_id}"
-            )
-            report_lines.append(f"   logo original={source_url}")
-            continue
-
-        logo_url = public_logo_url(local_path)
-        lines[index] = set_attr(lines[index], "tvg-logo", logo_url)
-        localized += 1
-        refreshed += 1
-
-        if white_bg:
-            white_backgrounds += 1
-
         report_lines.append(
-            f"✅ NORMALIZADO | {name} | tvg-id={tvg_id}"
+            f"   tvg-logo={logo_ref}"
         )
-        report_lines.append(f"   PNG={local_path.as_posix()}")
-        report_lines.append(f"   tvg-logo={logo_url}")
         report_lines.append(
-            f"   fondo_blanco={'SI' if white_bg else 'NO'}"
+            f"   fondo_blanco={'SI' if result.white_background else 'NO'}"
+        )
+        report_lines.append(
+            f"   detalle={result.reason}"
         )
 
-    # Si se solicita una URL publica, transforma referencias locales
-    # logos/archivo.png en la URL final de GitHub sin volver a descargar nada.
-    if args.logo_base_url:
-        base_url = args.logo_base_url.rstrip("/")
-        for index, extinf in entries:
-            current_logo = extract_attr(lines[index], "tvg-logo")
-            if not current_logo or current_logo.lower().startswith(("http://", "https://")):
-                continue
+        counts[result.source] = counts.get(result.source, 0) + 1
 
-            normalized = current_logo.replace("\\", "/")
-            filename = Path(normalized).name
-            local_path = logo_dir / filename
+    # -----------------------------------------------------------------------
+    # Integridad
+    # -----------------------------------------------------------------------
+    before_extinf = len(entries)
+    after_extinf = sum(
+        1 for line in lines
+        if line.startswith("#EXTINF:")
+    )
 
-            if local_path.exists() and local_path.suffix.lower() == ".png":
-                lines[index] = set_attr(
-                    lines[index],
-                    "tvg-logo",
-                    f"{base_url}/{filename}",
-                )
-
-    # Verificacion: nunca debe cambiar la cantidad de EXTINF.
-    final_count = sum(1 for line in lines if line.startswith("#EXTINF:"))
-    if final_count != total:
+    if before_extinf != after_extinf:
         print(
-            f"[!] ERROR DE INTEGRIDAD: antes={total}, despues={final_count}",
+            f"[!] ERROR DE INTEGRIDAD: "
+            f"antes={before_extinf} despues={after_extinf}",
             file=sys.stderr,
         )
+        session.close()
         return 2
 
-    try:
-        save_m3u(output_path, lines)
-    except Exception as exc:
-        print(f"[!] No se pudo escribir {output_path}: {exc}", file=sys.stderr)
-        return 1
+    save_m3u(output_path, lines)
 
     report_lines.extend([
         "",
         "RESUMEN",
         "-" * 72,
         f"Entradas EXTINF: {total}",
-        f"Ya tenian logo y fueron preservadas: {already}",
-        f"Logos nuevos agregados: {added}",
-        f"Logos existentes actualizados: {refreshed}",
-        f"Logos convertidos/normalizados a PNG: {localized}",
-        f"PNG con fondo blanco por visibilidad: {white_backgrounds}",
-        f"Fallos de descarga/conversion: {localization_failures}",
+        f"Logos PNG generados: {success}",
         f"Sin logo: {unresolved}",
+        f"PNG con fondo blanco por visibilidad: {backgrounds}",
         "",
-        "INTEGRIDAD:",
-        f"- Cantidad de EXTINF preservada: {'SI' if final_count == total else 'NO'}",
-        "- URLs de streams: no modificadas por este script.",
-        "- Entradas #EXTVLCOPT: no modificadas por este script.",
+        "FUENTES UTILIZADAS",
     ])
 
-    try:
-        report_path.write_text(
-            "\n".join(report_lines) + "\n",
-            encoding="utf-8",
+    for source, count in sorted(
+        counts.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    ):
+        report_lines.append(
+            f"- {source}: {count}"
         )
-    except Exception as exc:
-        print(f"[!] No se pudo escribir el informe: {exc}", file=sys.stderr)
-        return 1
+
+    report_lines.extend([
+        "",
+        "INTEGRIDAD:",
+        f"- Cantidad de EXTINF preservada: {'SI' if before_extinf == after_extinf else 'NO'}",
+        "- URLs de streams: no modificadas.",
+        "- Entradas #EXTVLCOPT: no modificadas.",
+        "- Canales: no eliminados.",
+        "- Logos almacenados localmente como PNG.",
+    ])
+
+    report_path.write_text(
+        "\n".join(report_lines) + "\n",
+        encoding="utf-8",
+    )
 
     print()
     print("[+] Proceso terminado.")
-    print(f"[+] Logos nuevos: {added}")
-    print(f"[+] Logos actualizados: {refreshed}")
+    print(f"[+] Logos PNG generados: {success}/{total}")
     print(f"[+] Sin logo: {unresolved}")
+    print(f"[+] Fondo blanco aplicado: {backgrounds}")
     print(f"[+] M3U: {output_path}")
     print(f"[+] Informe: {report_path}")
+    print(f"[+] Logos: {logo_dir}")
 
     session.close()
     return 0
