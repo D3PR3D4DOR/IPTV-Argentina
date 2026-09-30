@@ -23,16 +23,16 @@ Dependencias:
     pip install requests Pillow
 
 Uso:
-    python3 scripts/masterlist_argentina_latino_v10.py
+    python3 scripts/masterlist_argentina_latino_logos.py
 
 Ejemplo:
-    python3 scripts/masterlist_argentina_latino_v10.py \
+    python3 scripts/masterlist_argentina_latino_logos.py \
         --input masterlist_argentina_latino.m3u \
         --output masterlist_argentina_latino_logos.m3u \
         --report masterlist_argentina_latino_logos_report.txt
 
 Para volver a buscar y actualizar tambien los logos existentes:
-    python3 scripts/masterlist_argentina_latino_v10.py --refresh-existing
+    python3 scripts/masterlist_argentina_latino_logos.py --rasterize-existing
 """
 
 from __future__ import annotations
