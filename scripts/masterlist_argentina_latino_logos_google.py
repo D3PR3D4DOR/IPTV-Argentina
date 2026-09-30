@@ -45,10 +45,17 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 from PIL import Image
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+except ImportError:
+    webdriver = None
+    By = None
 
 
 GOOGLE_IMAGES_URL = "https://www.google.com/search"
@@ -362,160 +369,182 @@ def google_query(entry: Entry) -> str:
     return f'"{search_name(entry)}" logo'
 
 
-def extract_google_image_candidates(
-    source: str,
-    entry: Entry,
-) -> list[Candidate]:
-    """
-    Google Images cambia su HTML con frecuencia.
-
-    Intentamos varios formatos conocidos de metadata y asociamos el texto del
-    bloque con la URL original. No usamos solamente el nombre de dominio de
-    la imagen, porque eso produce demasiados falsos positivos.
-    """
-    result: list[Candidate] = []
-    query_name = search_name(entry)
-
-    # Formato murl dentro de bloques iusc de Bing-style metadata.
-    # Google a veces conserva estructuras similares en la respuesta.
-    patterns = [
-        r'"ou":"(https?://[^"]+)"[^{}]{0,3500}',
-        r'"original":"(https?://[^"]+)"[^{}]{0,3500}',
-        r'"url":"(https?://[^"]+)"[^{}]{0,3500}',
-    ]
-
-    found_urls: list[tuple[str, str]] = []
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, source, flags=re.IGNORECASE):
-            url = html.unescape(match.group(1))
-            url = url.replace("\\/", "/").replace('\\"', '"')
-            context = source[
-                max(0, match.start() - 2500):
-                min(len(source), match.end() + 2500)
-            ]
-            found_urls.append((url, context))
-
-    # Algunas respuestas contienen URLs escapadas como unicode.
-    normalized: list[tuple[str, str]] = []
-    seen: set[str] = set()
-
-    for url, context in found_urls:
-        url = unquote(url)
-        if not url.startswith(("http://", "https://")):
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        normalized.append((url, context))
-
-    for url, context in normalized:
-        evidence = html.unescape(context)
-        evidence = re.sub(r"\\/", "/", evidence)
-        evidence = re.sub(r"[^A-Za-z0-9]+", " ", evidence)
-
-        if not exact_name_ok(query_name, evidence):
-            continue
-
-        # Cuanto más cerca esté la evidencia del nombre consultado, más alto.
-        req = tokens(query_name)
-        got = tokens(evidence)
-        overlap = len(req & got) / max(len(req), 1)
-
-        result.append(
-            Candidate(
-                url=url,
-                score=0.70 + min(0.25, overlap * 0.20),
-                reason=f'Google Images: {google_query(entry)}',
-            )
+def build_browser(browser: str):
+    if webdriver is None:
+        raise RuntimeError(
+            "Falta Selenium. Ejecuta: python -m pip install selenium"
         )
 
-    return dedupe_candidates(result)[:12]
+    if browser == "firefox":
+        options = webdriver.FirefoxOptions()
+        options.add_argument("-headless")
+        options.set_preference(
+            "general.useragent.override",
+            GOOGLE_HEADERS["User-Agent"],
+        )
+        return webdriver.Firefox(options=options)
 
-
-def dedupe_candidates(items: list[Candidate]) -> list[Candidate]:
-    best: dict[str, Candidate] = {}
-
-    for item in items:
-        old = best.get(item.url)
-        if old is None or item.score > old.score:
-            best[item.url] = item
-
-    return sorted(
-        best.values(),
-        key=lambda x: x.score,
-        reverse=True,
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1400,1000")
+    options.add_argument(
+        f'--user-agent={GOOGLE_HEADERS["User-Agent"]}'
     )
+    return webdriver.Chrome(options=options)
+
+
+def original_url_from_imgres(href: str) -> str:
+    try:
+        values = parse_qs(
+            urlparse(href).query
+        ).get("imgurl")
+        if values:
+            return unquote(values[0])
+    except Exception:
+        pass
+    return ""
 
 
 def google_search(
+    driver,
     entry: Entry,
     logo_dir: Path,
 ) -> Result:
     query = google_query(entry)
+    target = logo_dir / image_filename(entry)
 
-    session = requests.Session()
+    url = (
+        f"{GOOGLE_IMAGES_URL}"
+        f"?tbm=isch"
+        f"&q={quote(query)}"
+        f"&hl=en"
+        f"&safe=active"
+    )
 
     try:
-        response = session.get(
-            GOOGLE_IMAGES_URL,
-            params={
-                "tbm": "isch",
-                "q": query,
-            },
-            timeout=TIMEOUT,
-            headers=GOOGLE_HEADERS,
-        )
-        response.raise_for_status()
+        driver.get(url)
+        time.sleep(2.5)
 
-        candidates = extract_google_image_candidates(
-            response.text,
-            entry,
-        )
+        page = driver.page_source.lower()
+        current = (driver.current_url or "").lower()
 
-        # Si Google no entrega metadata verificable, no inventamos.
-        if not candidates:
+        if (
+            "sorry" in current
+            or "consent" in current
+            or "before you continue" in page
+            or "unusual traffic" in page
+        ):
             return Result(
-                source="Google Images - SIN RESULTADO VERIFICABLE",
-                reason=f"No hubo resultado verificable para: {query}",
+                source="Google Images - BLOQUEADO",
+                reason=f"Google no mostro resultados para: {query}",
             )
 
-        target = logo_dir / image_filename(entry)
+        anchors = driver.find_elements(
+            By.CSS_SELECTOR,
+            'a[href*="/imgres?"]',
+        )
 
-        for candidate in candidates:
-            try:
-                data = get_image(session, candidate.url)
-                width, height = rasterize(data, target)
-                validate_png(target)
+        candidates: list[tuple[str, str]] = []
+        seen: set[str] = set()
 
-                return Result(
-                    path=target,
-                    source="Google Images",
-                    confidence=int(candidate.score * 100),
-                    reason=(
-                        f'{candidate.reason}; '
-                        f'{width}x{height}px; '
-                        f'URL={candidate.url}'
-                    ),
-                )
-            except Exception:
-                target.unlink(missing_ok=True)
+        for anchor in anchors:
+            href = anchor.get_attribute("href") or ""
+            image_url = original_url_from_imgres(href)
+
+            if not image_url or image_url in seen:
                 continue
+
+            seen.add(image_url)
+
+            evidence_parts: list[str] = []
+
+            try:
+                label = anchor.get_attribute("aria-label") or ""
+                if label:
+                    evidence_parts.append(label)
+            except Exception:
+                pass
+
+            try:
+                txt = anchor.text or ""
+                if txt:
+                    evidence_parts.append(txt)
+            except Exception:
+                pass
+
+            try:
+                for img in anchor.find_elements(By.TAG_NAME, "img")[:3]:
+                    alt = img.get_attribute("alt") or ""
+                    if alt:
+                        evidence_parts.append(alt)
+            except Exception:
+                pass
+
+            candidates.append(
+                (image_url, " ".join(evidence_parts))
+            )
+
+            if len(candidates) >= 20:
+                break
+
+        if not candidates:
+            return Result(
+                source="Google Images - SIN RESULTADO",
+                reason=f"No se pudieron extraer resultados de: {query}",
+            )
+
+        session = make_requests_session()
+
+        try:
+            for position, (image_url, evidence) in enumerate(
+                candidates,
+                start=1,
+            ):
+                # Google ya recibio una consulta exacta. Si el resultado no
+                # tiene texto accesible, usamos el orden de Google.
+                if evidence and not evidence_ok(entry, evidence):
+                    continue
+
+                try:
+                    width, height = download_image(
+                        session,
+                        image_url,
+                        target,
+                    )
+
+                    return Result(
+                        path=target,
+                        source="Google Images",
+                        reason=(
+                            f"consulta={query} | "
+                            f"resultado={position} | "
+                            f"evidencia={evidence[:180]} | "
+                            f"{width}x{height}px | "
+                            f"url={image_url}"
+                        ),
+                    )
+                except Exception:
+                    target.unlink(missing_ok=True)
+                    continue
+
+        finally:
+            session.close()
 
         return Result(
             source="Google Images - NO DESCARGABLE",
             reason=(
-                f"Google encontro candidatos para {query}, "
-                "pero no fue posible descargar una imagen valida."
+                f"Google devolvio {len(candidates)} resultados para "
+                f"{query}, pero ninguno fue descargable."
             ),
         )
-    except requests.RequestException as exc:
+
+    except Exception as exc:
+        target.unlink(missing_ok=True)
         return Result(
             source="Google Images - ERROR",
             reason=f"{type(exc).__name__}: {exc}",
         )
-    finally:
-        session.close()
 
 
 def main() -> int:
@@ -565,6 +594,12 @@ def main() -> int:
         "--no-google",
         action="store_true",
         help="solo descarga los logos existentes y deja faltantes pendientes",
+    )
+    parser.add_argument(
+        "--browser",
+        choices=("firefox", "chrome"),
+        default="firefox",
+        help="navegador para Google Images (default: firefox)",
     )
 
     args = parser.parse_args()
@@ -658,37 +693,57 @@ def main() -> int:
 
     # ---------------------------------------------------------------------
     # 2) Buscar SOLO los faltantes de la M3U principal en Google.
+    #    Se usa un navegador real porque Google Images ya no expone de forma
+    #    estable las URLs originales en una respuesta requests simple.
     # ---------------------------------------------------------------------
     missing_results: dict[tuple[str, str], Result] = {}
 
     if main_missing and not args.no_google:
         print()
-        print("[+] Buscando faltantes SOLO en Google Images...")
-        print("[+] Una consulta por vez para evitar bloqueos.")
+        print(
+            f"[+] Iniciando {args.browser} headless para Google Images..."
+        )
 
-        for position, entry in enumerate(main_missing, start=1):
+        try:
+            driver = build_browser(args.browser)
+        except Exception as exc:
             print(
-                f'[GOOGLE {position:>2}/{len(main_missing)}] '
-                f'{search_name(entry)} -> {google_query(entry)}'
+                f"[!] No se pudo iniciar el navegador: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
             )
+            return 1
 
-            result = google_search(entry, logo_dir)
-            key = (canon(entry.tvg_id), canon(entry.name))
-            missing_results[key] = result
-
-            if result.path:
+        try:
+            for position, entry in enumerate(main_missing, start=1):
                 print(
-                    f"    -> OK | {result.confidence}% | "
-                    f"{result.path.name}"
-                )
-            else:
-                print(
-                    f"    -> PENDIENTE | {result.source}"
+                    f'[GOOGLE {position:>2}/{len(main_missing)}] '
+                    f'{search_name(entry)} -> {google_query(entry)}'
                 )
 
-            # Pequeña pausa para no golpear Google con muchas solicitudes.
-            if position != len(main_missing):
-                time.sleep(1.5)
+                result = google_search(
+                    driver,
+                    entry,
+                    logo_dir,
+                )
+
+                key = (canon(entry.tvg_id), canon(entry.name))
+                missing_results[key] = result
+
+                if result.path:
+                    print(
+                        f"    -> OK | {result.path.name}"
+                    )
+                else:
+                    print(
+                        f"    -> PENDIENTE | {result.source}"
+                    )
+
+                if position != len(main_missing):
+                    time.sleep(1.5)
+
+        finally:
+            driver.quit()
 
     # ---------------------------------------------------------------------
     # 3) Generar M3U principal con logos locales.
