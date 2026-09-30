@@ -14,11 +14,11 @@ Fuentes de logo, en este orden general:
 1. tv-logo/tv-logos
 2. logo-tv/tv-logos
 3. hmlendea/tv-logos
-5. iptv-org
-6. logo actual de la M3U
-7. Wikimedia Commons
-8. Bing Images
-9. Google Images
+4. iptv-org
+5. logo actual de la M3U
+6. Wikimedia Commons
+7. Bing Images
+8. Google Images
 
 El orden real puede cambiar por coincidencia y disponibilidad.
 
@@ -94,6 +94,66 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
 # Fuentes locales tienen prioridad porque permiten almacenar nosotros mismos
 # una copia PNG y evitan depender de un servidor externo.
+CURATED_LOGO_SEARCHES = {
+    "history 2": [
+        "History2 logo 2022 Latin America",
+        "History 2 Latin America logo A+E Networks",
+    ],
+    "history2": [
+        "History2 logo 2022 Latin America",
+        "History 2 Latin America logo A+E Networks",
+    ],
+    "history": [
+        "History Latin America logo 2022 A+E Networks",
+    ],
+    "national geographic": [
+        "National Geographic Latin America logo channel",
+    ],
+    "sony channel": [
+        "Sony Channel Latin America logo",
+    ],
+    "studio universal": [
+        "Studio Universal Latin America logo",
+    ],
+    "universal tv": [
+        "Universal TV Latin America logo",
+    ],
+    "star channel": [
+        "Star Channel Latin America logo",
+    ],
+    "tnt novelas": [
+        "TNT Novelas Latin America logo",
+    ],
+    "disney channel": [
+        "Disney Channel Latin America logo",
+    ],
+    "disney jr": [
+        "Disney Junior Latin America logo",
+    ],
+    "axn south": [
+        "AXN South Latin America logo",
+        "AXN Latin America South logo",
+    ],
+    "axn": [
+        "AXN Latin America logo",
+    ],
+    "cinecanal": [
+        "Cinecanal Latin America logo",
+    ],
+    "fx": [
+        "FX Latin America logo",
+    ],
+    "lifetime": [
+        "Lifetime Latin America logo",
+    ],
+    "amc": [
+        "AMC Latin America channel logo",
+    ],
+    "comedy central": [
+        "Comedy Central Latin America logo",
+    ],
+}
+
 SOURCE_PRIORITY = {
     "tv-logo": 100,
     "logo-tv": 92,
@@ -532,15 +592,19 @@ def github_path_score(
     tvg_id: str,
     path: str,
 ) -> float:
-    # Solo comparamos con el nombre del archivo y una parte de la ruta.
     filename = Path(path).stem
-    score = name_similarity(name, filename)
+
+    name_n = canon(name)
+    file_n = canon(filename)
+    tvg_n = canon(tvg_id)
+
+    if file_n in {name_n, tvg_n} or name_n in {file_n, tvg_n}:
+        score = 1.0
+    else:
+        score = name_similarity(name, filename)
 
     text = canon(path)
-    score = min(
-        1.0,
-        score + region_score(text),
-    )
+    score = min(1.0, score + region_score(text))
 
     query_tokens = tokenize(name)
     path_tokens = tokenize(path)
@@ -552,13 +616,28 @@ def github_path_score(
         )
         score = max(score, overlap)
 
-    # Ayuda a separar variantes argentinas de variantes internacionales.
-    if ".ar" in canon(tvg_id):
-        if "argentina" in text:
-            score = min(1.0, score + 0.08)
+    if ".ar" in tvg_n and "argentina" in text:
+        score = min(1.0, score + 0.08)
 
-    return score
+    name_tokens = tokenize(name)
+    file_tokens = tokenize(filename)
+    if name_tokens and file_tokens:
+        distinctive = {
+            "south", "junior", "jr", "kids", "news", "music",
+            "plus", "max", "international", "cartoon", "accion",
+            "terror", "classic", "clasico", "novelas",
+        }
+        if "2" in name_n.split() and "2" not in file_n.split():
+            score -= 0.35
+        if "2" not in name_n.split() and "2" in file_n.split():
+            score -= 0.20
 
+        missing = (name_tokens & distinctive) - file_tokens
+        extra = (file_tokens & distinctive) - name_tokens
+        score -= 0.15 * len(missing)
+        score -= 0.10 * len(extra)
+
+    return max(0.0, min(1.0, score))
 
 def github_logo_candidates(
     name: str,
@@ -632,43 +711,55 @@ def wikimedia_search(
     premium: bool,
 ) -> list[LogoCandidate]:
     extra = " Latin America" if premium else " Argentina"
-    query = f'"{name}" television channel logo{extra}'
+    queries = list(CURATED_LOGO_SEARCHES.get(canon(name), []))
+    queries.append(f'"{name}" television channel logo{extra}')
 
-    params = {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": query,
-        "gsrnamespace": "6",
-        "gsrlimit": "12",
-        "prop": "imageinfo",
-        "iiprop": "url|mime|size",
-        "iiurlwidth": LOGO_THUMB_WIDTH,
-        "format": "json",
-        "formatversion": "2",
-    }
+    pages: list[dict] = []
 
-    try:
-        response = session.get(
-            COMMONS_API,
-            params=params,
-            timeout=SEARCH_TIMEOUT,
-            headers=session_headers("application/json"),
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (requests.RequestException, ValueError):
-        return []
+    for query in queries[:3]:
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": "6",
+            "gsrlimit": "12",
+            "prop": "imageinfo",
+            "iiprop": "url|mime|size",
+            "iiurlwidth": LOGO_THUMB_WIDTH,
+            "format": "json",
+            "formatversion": "2",
+        }
 
-    pages = data.get("query", {}).get("pages", [])
-    if not isinstance(pages, list):
-        return []
+        try:
+            response = session.get(
+                COMMONS_API,
+                params=params,
+                timeout=SEARCH_TIMEOUT,
+                headers=session_headers("application/json"),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            continue
+
+        found = data.get("query", {}).get("pages", [])
+        if isinstance(found, list):
+            pages.extend(found)
+
+    seen_titles: set[str] = set()
+    unique_pages: list[dict] = []
+    for page in pages:
+        title = str(page.get("title", ""))
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        unique_pages.append(page)
 
     result: list[LogoCandidate] = []
 
-    for page in pages:
+    for page in unique_pages:
         title = str(page.get("title", ""))
         info = page.get("imageinfo") or []
-
         if not info:
             continue
 
@@ -678,27 +769,32 @@ def wikimedia_search(
             or image.get("url")
             or ""
         )
-
         if not url.startswith("https://"):
             continue
 
-        title_norm = canon(title)
         score = name_similarity(name, title)
+        title_n = canon(title)
 
-        if "logo" in title_norm or "wordmark" in title_norm:
+        if "logo" in title_n or "wordmark" in title_n:
             score += 0.08
+
+        # No aceptar como alta confianza una variante que claramente
+        # omita el diferenciador del canal.
+        name_n = canon(name)
+        if "history 2" in name_n and "history2" not in title_n and "history 2" not in title_n:
+            score -= 0.30
 
         result.append(
             LogoCandidate(
                 url=url,
                 source="Wikimedia Commons",
-                match=min(1.0, score),
+                match=max(0.0, min(1.0, score)),
                 reason=f"Wikimedia: {title}",
             )
         )
 
     result.sort(key=lambda item: item.match, reverse=True)
-    return result[:8]
+    return result[:10]
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +820,8 @@ def bing_image_search(
     premium: bool,
 ) -> list[LogoCandidate]:
     region = "Latin America" if premium else "Argentina"
-    query = f"{name} TV channel logo {region}"
+    curated = CURATED_LOGO_SEARCHES.get(canon(name), [])
+    query = curated[0] if curated else f"{name} TV channel logo {region}"
 
     try:
         response = session.get(
@@ -1291,10 +1388,11 @@ def main() -> int:
             # 1) Repositorios de logos + iptv-org + logo que ya figuraba
             # en la M3U.
             result = try_pool(candidates)
-            if result:
+            if result and result.confidence >= 88:
                 return entry.index, result
 
-            # 2) Busqueda web SOLO si las fuentes estructuradas fallaron.
+            # 2) Si el candidato estructurado no alcanza alta confianza,
+            # damos una segunda opinion usando Wikimedia, Bing y Google.
             if web_search:
                 premium = canon(entry.group) == "premium latinoamerica"
 
@@ -1325,7 +1423,11 @@ def main() -> int:
                 )
 
                 # Damos una oportunidad a cada fuente web.
-                result = try_pool(web_candidates)
+                web_result = try_pool(web_candidates)
+                if web_result:
+                    if result is None or web_result.confidence >= result.confidence:
+                        return entry.index, web_result
+
                 if result:
                     return entry.index, result
 
