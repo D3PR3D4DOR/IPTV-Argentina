@@ -44,6 +44,7 @@ import json
 import hashlib
 import re
 import sys
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -70,6 +71,10 @@ COMMONS_TIMEOUT = 15
 LOGO_THUMB_WIDTH = 600
 LOGO_MAX_SIZE = 600
 LOGO_PADDING = 18
+WIKIMEDIA_MIN_INTERVAL = 1.25
+WIKIMEDIA_MAX_RETRIES = 5
+WIKIMEDIA_LOCK = threading.Lock()
+WIKIMEDIA_LAST_REQUEST = 0.0
 
 RASTER_FORMATS = {
     "PNG", "JPEG", "JPG", "WEBP", "GIF", "AVIF", "APNG"
@@ -395,14 +400,11 @@ def wikimedia_raster_url(
             "formatversion": "2",
         }
 
-        r = session.get(
+        r = _wikimedia_get(
+            session,
             COMMONS_API,
             params=params,
-            timeout=COMMONS_TIMEOUT,
-            headers={
-                "User-Agent": UA,
-                "Accept": "application/json",
-            },
+            accept="application/json",
         )
         r.raise_for_status()
 
@@ -426,6 +428,23 @@ def wikimedia_raster_url(
     return None
 
 
+def is_local_logo_ref(value: str, logo_dir: Path) -> bool:
+    if not value:
+        return False
+
+    normalized = value.replace("\\", "/").strip()
+    if normalized.startswith(("http://", "https://")):
+        return False
+
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+
+    logo_prefix = logo_dir.as_posix().rstrip("/") + "/"
+    return normalized.startswith(logo_prefix) or (
+        Path(normalized).parent.as_posix() == logo_dir.as_posix()
+    )
+
+
 def image_slug(name: str, tvg_id: str) -> str:
     base = canon(tvg_id) or canon(name) or "channel"
     base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
@@ -435,16 +454,78 @@ def image_slug(name: str, tvg_id: str) -> str:
     return f"{base[:70]}-{digest}.png"
 
 
+def _wikimedia_get(
+    session: requests.Session,
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    accept: str = "*/*",
+) -> requests.Response:
+    """
+    Solicitud serializada y con backoff para evitar respuestas HTTP 429 de
+    Wikimedia cuando se procesan muchos logos seguidos.
+    """
+    global WIKIMEDIA_LAST_REQUEST
+
+    last_error = None
+
+    for attempt in range(WIKIMEDIA_MAX_RETRIES + 1):
+        with WIKIMEDIA_LOCK:
+            now = time.monotonic()
+            wait = WIKIMEDIA_MIN_INTERVAL - (now - WIKIMEDIA_LAST_REQUEST)
+            if wait > 0:
+                time.sleep(wait)
+
+            response = session.get(
+                url,
+                params=params,
+                timeout=COMMONS_TIMEOUT if "wikimedia" in url else SOURCE_TIMEOUT,
+                headers={
+                    "User-Agent": UA,
+                    "Accept": accept,
+                },
+                allow_redirects=True,
+            )
+            WIKIMEDIA_LAST_REQUEST = time.monotonic()
+
+        if response.status_code != 429:
+            return response
+
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            delay = max(2.0, float(retry_after))
+        except ValueError:
+            delay = min(30.0, 2.0 ** attempt)
+
+        response.close()
+        last_error = RuntimeError(
+            f"HTTP 429 de Wikimedia; reintento {attempt + 1}/{WIKIMEDIA_MAX_RETRIES}"
+        )
+        time.sleep(delay)
+
+    raise last_error or RuntimeError("Wikimedia devolvio HTTP 429")
+
+
 def download_logo_bytes(session: requests.Session, url: str) -> bytes:
-    r = session.get(
-        url,
-        timeout=SOURCE_TIMEOUT,
-        headers={
-            "User-Agent": UA,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        },
-        allow_redirects=True,
-    )
+    is_wikimedia = "wikimedia.org/" in url.lower()
+
+    if is_wikimedia:
+        r = _wikimedia_get(
+            session,
+            url,
+            accept="image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        )
+    else:
+        r = session.get(
+            url,
+            timeout=SOURCE_TIMEOUT,
+            headers={
+                "User-Agent": UA,
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+            allow_redirects=True,
+        )
+
     r.raise_for_status()
 
     if len(r.content) > 10 * 1024 * 1024:
@@ -924,8 +1005,14 @@ def main() -> int:
     pending: list[tuple[int, str]] = []
     existing_to_rasterize: list[tuple[int, str]] = []
 
+    logo_dir = Path(args.logo_dir)
+
     for index, extinf in entries:
         current_logo = extract_attr(extinf, "tvg-logo")
+
+        if current_logo and is_local_logo_ref(current_logo, logo_dir):
+            already += 1
+            continue
 
         if current_logo and args.rasterize_existing:
             existing_to_rasterize.append((index, extinf))
@@ -1019,8 +1106,6 @@ def main() -> int:
     # -----------------------------------------------------------------------
     # Aplicar tvg-logo y generar PNG locales normalizados.
     # -----------------------------------------------------------------------
-    logo_dir = Path(args.logo_dir)
-
     added = 0
     unresolved = 0
     refreshed = 0
@@ -1157,6 +1242,26 @@ def main() -> int:
         report_lines.append(
             f"   fondo_blanco={'SI' if white_bg else 'NO'}"
         )
+
+    # Si se solicita una URL publica, transforma referencias locales
+    # logos/archivo.png en la URL final de GitHub sin volver a descargar nada.
+    if args.logo_base_url:
+        base_url = args.logo_base_url.rstrip("/")
+        for index, extinf in entries:
+            current_logo = extract_attr(lines[index], "tvg-logo")
+            if not current_logo or current_logo.lower().startswith(("http://", "https://")):
+                continue
+
+            normalized = current_logo.replace("\\", "/")
+            filename = Path(normalized).name
+            local_path = logo_dir / filename
+
+            if local_path.exists() and local_path.suffix.lower() == ".png":
+                lines[index] = set_attr(
+                    lines[index],
+                    "tvg-logo",
+                    f"{base_url}/{filename}",
+                )
 
     # Verificacion: nunca debe cambiar la cantidad de EXTINF.
     final_count = sum(1 for line in lines if line.startswith("#EXTINF:"))
