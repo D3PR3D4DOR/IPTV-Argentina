@@ -21,19 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - name: Test yt-dlp
-
-        run: |
-          python3 -m pip install -U "yt-dlp[default]"
-          node --version
-          yt-dlp --version
-          yt-dlp \
-            --remote-components ejs:github \
-            --js-runtimes node \
-            -v \
-            -F \
-            "https://www.youtube.com/watch?v=cb12KmMMDJA"
-
       - name: Grab Link
 
         run: |
