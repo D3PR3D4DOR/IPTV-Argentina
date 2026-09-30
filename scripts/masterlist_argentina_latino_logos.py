@@ -19,8 +19,8 @@ IMPORTANTE:
 - Nunca reemplaza el stream por otro.
 - Si no encuentra un logo con suficiente confianza, lo deja sin logo y lo informa.
 
-Dependencia:
-    pip install requests
+Dependencias:
+    pip install requests Pillow
 
 Uso:
     python3 scripts/masterlist_argentina_latino_v10.py
@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import io
 import json
+import hashlib
 import re
 import sys
 import time
@@ -51,6 +53,7 @@ from typing import Any, Optional
 from urllib.parse import urlencode
 
 import requests
+from PIL import Image
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +68,8 @@ UA = "Masterlist-Argentina-LATAM/1.1"
 SOURCE_TIMEOUT = 25
 COMMONS_TIMEOUT = 15
 LOGO_THUMB_WIDTH = 600
+LOGO_MAX_SIZE = 600
+LOGO_PADDING = 18
 
 RASTER_FORMATS = {
     "PNG", "JPEG", "JPG", "WEBP", "GIF", "AVIF", "APNG"
@@ -421,6 +426,116 @@ def wikimedia_raster_url(
     return None
 
 
+def image_slug(name: str, tvg_id: str) -> str:
+    base = canon(tvg_id) or canon(name) or "channel"
+    base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+    digest = hashlib.sha1(
+        f"{tvg_id}|{name}".encode("utf-8")
+    ).hexdigest()[:8]
+    return f"{base[:70]}-{digest}.png"
+
+
+def download_logo_bytes(session: requests.Session, url: str) -> bytes:
+    r = session.get(
+        url,
+        timeout=SOURCE_TIMEOUT,
+        headers={
+            "User-Agent": UA,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        },
+        allow_redirects=True,
+    )
+    r.raise_for_status()
+
+    if len(r.content) > 10 * 1024 * 1024:
+        raise RuntimeError("logo demasiado grande (>10 MB)")
+
+    return r.content
+
+
+def rasterize_logo(data: bytes, output_path: Path) -> tuple[bool, bool]:
+    with Image.open(io.BytesIO(data)) as source:
+        image = source.convert("RGBA")
+
+        alpha = image.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox:
+            image = image.crop(bbox)
+
+        image.thumbnail(
+            (LOGO_MAX_SIZE, LOGO_MAX_SIZE),
+            Image.Resampling.LANCZOS,
+        )
+
+        padded = Image.new(
+            "RGBA",
+            (
+                image.width + LOGO_PADDING * 2,
+                image.height + LOGO_PADDING * 2,
+            ),
+            (0, 0, 0, 0),
+        )
+        padded.alpha_composite(image, (LOGO_PADDING, LOGO_PADDING))
+        image = padded
+
+        visible_alpha = image.getchannel("A")
+        gray = image.convert("RGB").convert("L")
+
+        pixels = [
+            gray.getpixel((x, y))
+            for y in range(image.height)
+            for x in range(image.width)
+            if visible_alpha.getpixel((x, y)) > 32
+        ]
+
+        white_background = False
+        if pixels:
+            mean_luma = sum(pixels) / len(pixels)
+            dark_ratio = sum(1 for value in pixels if value < 85) / len(pixels)
+
+            if mean_luma < 115 and dark_ratio >= 0.45:
+                white_background = True
+
+        if white_background:
+            background = Image.new(
+                "RGBA",
+                image.size,
+                (255, 255, 255, 255),
+            )
+            background.alpha_composite(image)
+            image = background
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(output_path, format="PNG", optimize=True)
+
+    return True, white_background
+
+
+def localize_logo(
+    session: requests.Session,
+    logo: LogoResult,
+    name: str,
+    tvg_id: str,
+    logo_dir: Path,
+) -> tuple[Optional[Path], bool]:
+    if not logo.url:
+        return None, False
+
+    try:
+        data = download_logo_bytes(session, logo.url)
+        target = logo_dir / image_slug(name, tvg_id)
+        ok, white_bg = rasterize_logo(data, target)
+        if ok:
+            return target, white_bg
+    except Exception as exc:
+        print(
+            f"[!] No se pudo rasterizar {name}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+    return None, False
+
+
 def make_raster_result(
     session: requests.Session,
     item: dict,
@@ -618,34 +733,22 @@ def commons_logo_search(
         if not url.startswith("https://"):
             continue
 
-        # Wikimedia entrega thumburl rasterizado incluso cuando el original
-        # es SVG. Evitamos URL SVG directas en el resultado final.
         if url.lower().split("?", 1)[0].endswith(".svg"):
             continue
 
-        if mime.startswith("image/") and mime not in {"image/svg+xml"}:
-            pass
-        elif not mime:
-            # Si no llega thumbmime, la extensión del thumburl debe ser raster.
-            if not re.search(r"\.(?:png|jpe?g|webp|gif|avif|apng)(?:$|[?])", url, re.I):
-                continue
-        else:
+        if mime == "image/svg+xml":
+            continue
+
+        if mime and not mime.startswith("image/"):
             continue
 
         title_norm = canon(title)
-
-        has_logo_word = "logo" in title_norm or "wordmark" in title_norm
-        if not has_logo_word:
+        if "logo" not in title_norm and "wordmark" not in title_norm:
             continue
 
         similarity = name_similarity(name, title)
         if name_norm_contains(name, title):
             similarity = max(similarity, 0.90)
-
-        # Preferimos thumbnails de imagen reales; no penalizamos un logo
-        # correcto por ser un thumbnail raster.
-        if "white" in title_norm:
-            similarity = min(1.0, similarity + 0.03)
 
         if similarity > best[0]:
             best = (similarity, {"url": url, "title": title})
@@ -659,7 +762,6 @@ def commons_logo_search(
         confidence=int(best[0] * 100),
         reason=f"busqueda web -> {best[1]['title']}",
     )
-
 
 
 
@@ -755,6 +857,21 @@ def main() -> int:
         action="store_true",
         help="no usar Wikimedia Commons como busqueda web de respaldo",
     )
+    parser.add_argument(
+        "--logo-dir",
+        default="logos",
+        help="carpeta donde se guardan los PNG normalizados",
+    )
+    parser.add_argument(
+        "--logo-base-url",
+        default="",
+        help="URL base publica para los PNG del directorio de logos",
+    )
+    parser.add_argument(
+        "--rasterize-existing",
+        action="store_true",
+        help="tambien normaliza a PNG los logos que ya existen en la M3U",
+    )
 
     args = parser.parse_args()
 
@@ -796,9 +913,15 @@ def main() -> int:
     total = len(entries)
     already = 0
     pending: list[tuple[int, str]] = []
+    existing_to_rasterize: list[tuple[int, str]] = []
 
     for index, extinf in entries:
         current_logo = extract_attr(extinf, "tvg-logo")
+
+        if current_logo and args.rasterize_existing:
+            existing_to_rasterize.append((index, extinf))
+            continue
+
         if current_logo and not args.refresh_existing:
             already += 1
             continue
@@ -809,6 +932,7 @@ def main() -> int:
     print(f"[+] Entradas EXTINF: {total}")
     print(f"[+] Con logo existente (preservado): {already}")
     print(f"[+] A resolver: {len(pending)}")
+    print(f"[+] A normalizar a PNG: {len(existing_to_rasterize)}")
     print()
 
     # -----------------------------------------------------------------------
@@ -884,19 +1008,34 @@ def main() -> int:
                 results[index] = result
 
     # -----------------------------------------------------------------------
-    # Aplicar exclusivamente tvg-logo.
+    # Aplicar tvg-logo y generar PNG locales normalizados.
     # -----------------------------------------------------------------------
+    logo_dir = Path(args.logo_dir)
+
     added = 0
     unresolved = 0
     refreshed = 0
+    localized = 0
+    white_backgrounds = 0
+    localization_failures = 0
 
     report_lines = [
-        "Masterlist Argentina + Premium Latinoamerica Logo Report",
+        "Masterlist Argentina + Premium Latinoamerica - Logo Report",
         "=" * 72,
         f"M3U entrada: {input_path}",
         f"M3U salida: {output_path}",
+        f"Directorio de logos: {logo_dir}",
         "",
     ]
+
+    def public_logo_url(local_path: Path) -> str:
+        if args.logo_base_url:
+            return (
+                args.logo_base_url.rstrip("/")
+                + "/"
+                + local_path.name
+            )
+        return local_path.as_posix()
 
     for index, extinf in pending:
         result = results.get(
@@ -912,30 +1051,103 @@ def main() -> int:
         tvg_id = extract_attr(extinf, "tvg-id")
         old_logo = extract_attr(extinf, "tvg-logo")
 
-        if result.url:
-            lines[index] = set_attr(lines[index], "tvg-logo", result.url)
-
-            if old_logo:
-                refreshed += 1
-                action = "ACTUALIZADO"
-            else:
-                added += 1
-                action = "AGREGADO"
-
-            report_lines.append(
-                f"✅ {action} | {name} | tvg-id={tvg_id}"
-            )
-            report_lines.append(
-                f"   fuente={result.source} | confianza={result.confidence}%"
-            )
-            report_lines.append(f"   logo={result.url}")
-            report_lines.append(f"   detalle={result.reason}")
-        else:
+        if not result.url:
             unresolved += 1
             report_lines.append(
                 f"❌ SIN LOGO | {name} | tvg-id={tvg_id}"
             )
             report_lines.append(f"   detalle={result.reason}")
+            continue
+
+        local_path, white_bg = localize_logo(
+            session,
+            result,
+            name,
+            tvg_id,
+            logo_dir,
+        )
+
+        if not local_path:
+            localization_failures += 1
+            unresolved += 1
+            report_lines.append(
+                f"❌ SIN PNG LOCAL | {name} | tvg-id={tvg_id}"
+            )
+            report_lines.append(f"   logo remoto={result.url}")
+            report_lines.append("   detalle=No se pudo descargar/convertir la imagen.")
+            continue
+
+        logo_url = public_logo_url(local_path)
+        lines[index] = set_attr(lines[index], "tvg-logo", logo_url)
+
+        if old_logo:
+            refreshed += 1
+            action = "ACTUALIZADO"
+        else:
+            added += 1
+            action = "AGREGADO"
+
+        localized += 1
+        if white_bg:
+            white_backgrounds += 1
+
+        report_lines.append(
+            f"✅ {action} | {name} | tvg-id={tvg_id}"
+        )
+        report_lines.append(
+            f"   fuente={result.source} | confianza={result.confidence}%"
+        )
+        report_lines.append(f"   PNG={local_path.as_posix()}")
+        report_lines.append(f"   tvg-logo={logo_url}")
+        report_lines.append(
+            f"   fondo_blanco={'SI' if white_bg else 'NO'}"
+        )
+        report_lines.append(f"   detalle={result.reason}")
+
+    for index, extinf in existing_to_rasterize:
+        name = visible_name(extinf)
+        tvg_id = extract_attr(extinf, "tvg-id")
+        source_url = extract_attr(extinf, "tvg-logo")
+
+        source_logo = LogoResult(
+            url=source_url,
+            source="logo existente",
+            confidence=100,
+            reason="Logo existente normalizado a PNG local.",
+        )
+
+        local_path, white_bg = localize_logo(
+            session,
+            source_logo,
+            name,
+            tvg_id,
+            logo_dir,
+        )
+
+        if not local_path:
+            localization_failures += 1
+            report_lines.append(
+                f"❌ NO NORMALIZADO | {name} | tvg-id={tvg_id}"
+            )
+            report_lines.append(f"   logo original={source_url}")
+            continue
+
+        logo_url = public_logo_url(local_path)
+        lines[index] = set_attr(lines[index], "tvg-logo", logo_url)
+        localized += 1
+        refreshed += 1
+
+        if white_bg:
+            white_backgrounds += 1
+
+        report_lines.append(
+            f"✅ NORMALIZADO | {name} | tvg-id={tvg_id}"
+        )
+        report_lines.append(f"   PNG={local_path.as_posix()}")
+        report_lines.append(f"   tvg-logo={logo_url}")
+        report_lines.append(
+            f"   fondo_blanco={'SI' if white_bg else 'NO'}"
+        )
 
     # Verificacion: nunca debe cambiar la cantidad de EXTINF.
     final_count = sum(1 for line in lines if line.startswith("#EXTINF:"))
@@ -960,6 +1172,9 @@ def main() -> int:
         f"Ya tenian logo y fueron preservadas: {already}",
         f"Logos nuevos agregados: {added}",
         f"Logos existentes actualizados: {refreshed}",
+        f"Logos convertidos/normalizados a PNG: {localized}",
+        f"PNG con fondo blanco por visibilidad: {white_backgrounds}",
+        f"Fallos de descarga/conversion: {localization_failures}",
         f"Sin logo: {unresolved}",
         "",
         "INTEGRIDAD:",
