@@ -521,8 +521,17 @@ def localize_logo(
     if not logo.url:
         return None, False
 
+    source_url = logo.url
+
+    # Si el logo existente es un SVG de Wikimedia, primero pedimos un
+    # thumbnail rasterizado. Pillow no necesita soportar SVG directamente.
+    if source_url.lower().split("?", 1)[0].endswith(".svg"):
+        raster = wikimedia_raster_url(session, source_url)
+        if raster:
+            source_url = raster
+
     try:
-        data = download_logo_bytes(session, logo.url)
+        data = download_logo_bytes(session, source_url)
         target = logo_dir / image_slug(name, tvg_id)
         ok, white_bg = rasterize_logo(data, target)
         if ok:
