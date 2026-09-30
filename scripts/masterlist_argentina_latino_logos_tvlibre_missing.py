@@ -528,6 +528,7 @@ def main() -> int:
     parser.add_argument(
         "--logo-dir",
         default="logos",
+        help="carpeta donde se guardan los nuevos logos (por defecto: logos)",
     )
     parser.add_argument(
         "--logo-base-url",
