@@ -348,37 +348,37 @@ https://stmv6.voxtvhd.com.br/cineclasico/cineclasico/playlist.m3u8
 https://stmv6.voxtvhd.com.br/cineterror/cineterror/playlist.m3u8
 
 # ============ PREMIUM LATINOAMERICA AGREGADO ============
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="AMCLatinAmerica.us@Panregional",AMC
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="AMCLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/amclatinamerica-us-panregional-8b1ce132d0.png",AMC
 http://138.121.15.230:9002/AMC/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="AXNLatinAmerica.us@Panregional",AXN
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="AXNLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/axnlatinamerica-us-panregional-d2ae96f119.png",AXN
 http://181.119.66.28:8081/AXN/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="AXNLatinAmerica.us@South",AXN South
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="AXNLatinAmerica.us@South" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/axnlatinamerica-us-south-cb8f40a531.png",AXN South
 http://45.228.235.116:8000/play/a0iy/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="Cinecanal.us@Panregional",Cinecanal
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="Cinecanal.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/cinecanal-us-panregional-0bd237905b.png",Cinecanal
 http://181.119.66.28:8081/CINECANAL-HD/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="ComedyCentralLatinAmerica.us@Panregional",Comedy Central
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="ComedyCentralLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/comedycentrallatinamerica-us-panregional-15b42af955.png",Comedy Central
 http://190.93.224.42/COMEDY-CENTRAL/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="DisneyChannelLatinAmerica.ar@Panregional",Disney Channel
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="DisneyChannelLatinAmerica.ar@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/disneychannellatinamerica-ar-panregional-3a041874d8.png",Disney Channel
 http://190.14.10.19:16000/play/a06z/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="DisneyJrLatinAmerica.ar@North",Disney Jr.
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="DisneyJrLatinAmerica.ar@North" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/disneyjrlatinamerica-ar-north-666c8b3bfa.png",Disney Jr.
 http://190.14.10.19:16000/play/a02d/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="FXLatinAmerica.us@Panregional",FX
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="FXLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/fxlatinamerica-us-panregional-464816e474.png",FX
 http://181.119.66.28:8081/FX-HD/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="History2LatinAmerica.us@Panregional",History 2
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="History2LatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/history-2-latinamerica-us-panregional-660cc843ad.png",History 2
 http://181.119.66.28:8081/HISTORY-2/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="HistoryLatinAmerica.us@Panregional",History
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="HistoryLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/historylatinamerica-us-panregional-22f404d219.png",History
 http://181.119.66.28:8081/History-HD/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="LifetimeLatinAmerica.us@Panregional",Lifetime
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="LifetimeLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/lifetimelatinamerica-us-panregional-8c73882e92.png",Lifetime
 http://181.119.66.28:8081/Lifetime-HD/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="NationalGeographicLatinAmerica.us@Panregional",National Geographic
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="NationalGeographicLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/nationalgeographiclatinamerica-us-panregional-20227b28e6.png",National Geographic
 http://190.93.224.42/NAT-GEO/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="SonyChannelAndes.us@SD",Sony Channel
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="SonyChannelAndes.us@SD" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/sonychannelandes-us-sd-742b72c75a.png",Sony Channel
 http://181.119.66.28:8081/SONY-HD/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="StarChannelLatinAmerica.us@Panregional",Star Channel
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="StarChannelLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/starchannellatinamerica-us-panregional-bd612b8153.png",Star Channel
 http://181.119.66.28:8081/STAR-CHANNEL/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="StudioUniversalLatinAmerica.us@Panregional",Studio Universal
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="StudioUniversalLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/studiouniversallatinamerica-us-panregional-3a3799927d.png",Studio Universal
 http://190.93.224.42/STUDIO-UNIVERSAL/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="TNTNovelas.us@Panregional",TNT Novelas
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="TNTNovelas.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/tntnovelas-us-panregional-fb33e149da.png",TNT Novelas
 http://190.93.224.42/TNT-NOVELAS/index.m3u8
-#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="UniversalTVLatinAmerica.us@Panregional",Universal TV
+#EXTINF:-1 group-title="Premium Latinoamérica" tvg-id="UniversalTVLatinAmerica.us@Panregional" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/main/logos/universaltvlatinamerica-us-panregional-6bde1613d8.png",Universal TV
 http://181.119.66.28:8081/Universal-HD/index.m3u8
