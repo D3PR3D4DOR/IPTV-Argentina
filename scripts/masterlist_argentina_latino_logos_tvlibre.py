@@ -1012,6 +1012,7 @@ def main() -> int:
                     downloaded_by_url[url] = (
                         entry,
                         Result(
+                            path=None,
                             source="M3U - IMAGEN SOSPECHOSA",
                             reason=(
                                 "La URL devolvió una imagen idéntica a "
