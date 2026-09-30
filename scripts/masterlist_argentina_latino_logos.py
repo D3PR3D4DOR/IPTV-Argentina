@@ -1111,17 +1111,6 @@ def all_candidates_for_entry(
         reverse=True,
     )
 
-    if web_search:
-        # Las búsquedas web se hacen después de las fuentes estructuradas.
-        candidates.extend(
-            wikimedia_search(session, entry.name, premium)
-        )
-        candidates.extend(
-            bing_image_search(session, entry.name, premium)
-        )
-        candidates.extend(
-            google_image_search(session, entry.name, premium)
-        )
 
     # Deduplicar por URL.
     output: list[LogoCandidate] = []
@@ -1287,6 +1276,9 @@ def main() -> int:
         finally:
             local_session.close()
 
+    print("[+] Fuentes estructuradas: tv-logo, Fourqui, logo-tv, hmlendea, iptv-org y M3U.")
+    if web_search:
+        print("[+] Google/Bing/Wikimedia se usaran solo como fallback.")
     print("[+] Buscando candidatos para los canales...")
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -1316,13 +1308,14 @@ def main() -> int:
             entry.tvg_id,
         )
 
+        if target.exists():
+            target.unlink()
+
         local_session = requests.Session()
 
-        try:
-            # Prioridad dinámica:
-            # match -> fuente -> tamaño.
+        def try_pool(pool: list[LogoCandidate]) -> Optional[LogoResult]:
             ordered = sorted(
-                candidates,
+                pool,
                 key=lambda item: (
                     item.match,
                     SOURCE_PRIORITY.get(item.source, 50),
@@ -1330,10 +1323,9 @@ def main() -> int:
                 reverse=True,
             )
 
-            # Primera pasada: candidatos estructurados y logo actual.
             tried: list[str] = []
 
-            for candidate in ordered[:args.candidate_limit]:
+            for candidate in ordered:
                 try:
                     (
                         ok,
@@ -1355,15 +1347,12 @@ def main() -> int:
                         height,
                     )
 
-                    result = LogoResult(
+                    return LogoResult(
                         path=target,
                         source=candidate.source,
                         confidence=min(
                             99,
-                            max(
-                                1,
-                                int(score * 100),
-                            ),
+                            max(1, int(score * 100)),
                         ),
                         reason=(
                             f"{candidate.reason}; "
@@ -1372,25 +1361,77 @@ def main() -> int:
                         white_background=white_background,
                     )
 
-                    return entry.index, result
-
                 except Exception as exc:
                     tried.append(
-                        f"{candidate.source}: "
-                        f"{type(exc).__name__}"
+                        f"{candidate.source}: {type(exc).__name__}"
                     )
+
+            if tried:
+                failures[entry.index] = tried[:12]
+
+            return None
+
+        try:
+            # 1) Repositorios de logos + iptv-org + logo que ya figuraba
+            # en la M3U.
+            result = try_pool(candidates)
+            if result:
+                return entry.index, result
+
+            # 2) Busqueda web SOLO si las fuentes estructuradas fallaron.
+            if web_search:
+                premium = canon(entry.group) == "premium latinoamerica"
+
+                print(f"[WEB] Buscando alternativas: {entry.name}")
+
+                web_candidates: list[LogoCandidate] = []
+
+                web_candidates.extend(
+                    wikimedia_search(
+                        local_session,
+                        entry.name,
+                        premium,
+                    )
+                )
+                web_candidates.extend(
+                    bing_image_search(
+                        local_session,
+                        entry.name,
+                        premium,
+                    )
+                )
+                web_candidates.extend(
+                    google_image_search(
+                        local_session,
+                        entry.name,
+                        premium,
+                    )
+                )
+
+                # Damos una oportunidad a cada fuente web.
+                result = try_pool(web_candidates)
+                if result:
+                    return entry.index, result
+
+            reason = (
+                "No se encontro una imagen PNG valida en las fuentes "
+                "estructuradas ni en los buscadores web."
+            )
+
+            if entry.index in failures:
+                reason += " Intentos: " + "; ".join(
+                    failures[entry.index][:8]
+                )
 
             return entry.index, LogoResult(
                 source="NO ENCONTRADO",
                 confidence=0,
-                reason=(
-                    "Ninguna fuente produjo una imagen valida. "
-                    + "; ".join(tried[:8])
-                ),
+                reason=reason,
             )
 
         finally:
             local_session.close()
+
 
     print("[+] Descargando y normalizando logos...")
 
