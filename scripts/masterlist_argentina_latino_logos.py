@@ -64,6 +64,8 @@ from PIL import Image
 IPTV_ORG_CHANNELS = "https://iptv-org.github.io/api/channels.json"
 IPTV_ORG_LOGOS = "https://iptv-org.github.io/api/logos.json"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+TV_LOGOS_TREE = "https://api.github.com/repos/tv-logo/tv-logos/git/trees/main?recursive=1"
+TV_LOGOS_RAW = "https://raw.githubusercontent.com/tv-logo/tv-logos/main/"
 
 UA = "Masterlist-Argentina-LATAM/1.1"
 SOURCE_TIMEOUT = 25
@@ -71,6 +73,7 @@ COMMONS_TIMEOUT = 15
 LOGO_THUMB_WIDTH = 600
 LOGO_MAX_SIZE = 600
 LOGO_PADDING = 18
+TV_LOGOS_MIN_SCORE = 0.70
 WIKIMEDIA_MIN_INTERVAL = 1.25
 WIKIMEDIA_MAX_RETRIES = 5
 WIKIMEDIA_LOCK = threading.Lock()
@@ -224,6 +227,114 @@ def save_m3u(path: Path, lines: list[str]) -> None:
 
     # Las playlists M3U publicas de iptv-org usan CRLF.
     path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# TV-LOGO/Tv-logos - FALLBACK PNG PARA FONDOS OSCUROS
+# ---------------------------------------------------------------------------
+
+def build_tv_logo_index(session: requests.Session) -> list[str]:
+    """
+    Obtiene una sola vez el arbol del repositorio tv-logo/tv-logos.
+
+    Ese repositorio publica logos en PNG y declara que estan preparados para
+    fondos oscuros, por lo que es una fuente especialmente util cuando
+    Wikimedia no responde o entrega una variante poco visible.
+    """
+    try:
+        r = session.get(
+            TV_LOGOS_TREE,
+            timeout=COMMONS_TIMEOUT,
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError):
+        return []
+
+    tree = data.get("tree", [])
+    if not isinstance(tree, list):
+        return []
+
+    paths = []
+    for item in tree:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = str(item.get("type", ""))
+        item_path = str(item.get("path", ""))
+
+        if item_type != "blob":
+            continue
+        if not item_path.lower().endswith(".png"):
+            continue
+
+        paths.append(item_path)
+
+    return paths
+
+
+def tv_logo_name_score(
+    name: str,
+    tvg_id: str,
+    path: str,
+) -> float:
+    filename = Path(path).stem
+    q_names = [name, tvg_id_base(tvg_id)]
+
+    best = 0.0
+    for query in q_names:
+        if not query:
+            continue
+
+        score = name_similarity(query, filename)
+
+        q_tokens = tokenize(query)
+        f_tokens = tokenize(filename)
+
+        if q_tokens and f_tokens:
+            overlap = len(q_tokens & f_tokens) / max(len(q_tokens), len(f_tokens))
+            score = max(score, overlap)
+
+        best = max(best, score)
+
+    path_norm = canon(path)
+
+    # Preferimos logos argentinos para canales argentinos y variantes
+    # World-Latin-America/International para señales regionales.
+    if "argentina" in path_norm:
+        best += 0.08
+    elif "world latin america" in path_norm:
+        best += 0.06
+    elif "international" in path_norm:
+        best += 0.04
+
+    return min(1.0, best)
+
+
+def find_tv_logo(
+    name: str,
+    tvg_id: str,
+    paths: list[str],
+) -> Optional[str]:
+    if not paths:
+        return None
+
+    ranked = sorted(
+        (
+            (tv_logo_name_score(name, tvg_id, path), path)
+            for path in paths
+        ),
+        reverse=True,
+    )
+
+    if not ranked or ranked[0][0] < TV_LOGOS_MIN_SCORE:
+        return None
+
+    return TV_LOGOS_RAW + ranked[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +709,7 @@ def localize_logo(
     name: str,
     tvg_id: str,
     logo_dir: Path,
+    tv_logo_paths: list[str],
 ) -> tuple[Optional[Path], bool]:
     if not logo.url:
         return None, False
@@ -619,9 +731,29 @@ def localize_logo(
             return target, white_bg
     except Exception as exc:
         print(
-            f"[!] No se pudo rasterizar {name}: {type(exc).__name__}: {exc}",
+            f"[!] Fuente primaria no disponible para {name}: "
+            f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
+
+    # Fallback independiente de Wikimedia: tv-logo/tv-logos.
+    # Son PNG y el propio proyecto indica que estan preparados para fondos
+    # oscuros.
+    alt_url = find_tv_logo(name, tvg_id, tv_logo_paths)
+    if alt_url:
+        try:
+            print(f"[+] Fallback tv-logo/tv-logos: {name}")
+            data = download_logo_bytes(session, alt_url)
+            target = logo_dir / image_slug(name, tvg_id)
+            ok, white_bg = rasterize_logo(data, target)
+            if ok:
+                return target, white_bg
+        except Exception as exc:
+            print(
+                f"[!] Fallback tv-logo fallo para {name}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     return None, False
 
@@ -991,6 +1123,10 @@ def main() -> int:
         session.close()
         return 1
 
+    print("[+] Descargando indice de tv-logo/tv-logos...")
+    tv_logo_paths = build_tv_logo_index(session)
+    print(f"[+] Logos PNG disponibles en tv-logo/tv-logos: {len(tv_logo_paths)}")
+
     # -----------------------------------------------------------------------
     # Identificar entradas EXTINF y decidir cuales necesitan resolucion.
     # -----------------------------------------------------------------------
@@ -1159,6 +1295,7 @@ def main() -> int:
             name,
             tvg_id,
             logo_dir,
+            tv_logo_paths,
         )
 
         if not local_path:
