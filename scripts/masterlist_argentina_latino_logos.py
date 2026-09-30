@@ -714,7 +714,31 @@ def localize_logo(
     if not logo.url:
         return None, False
 
+    def save_from_url(source_url: str) -> tuple[Optional[Path], bool]:
+        data = download_logo_bytes(session, source_url)
+        target = logo_dir / image_slug(name, tvg_id)
+        ok, white_bg = rasterize_logo(data, target)
+        if ok:
+            return target, white_bg
+        return None, False
+
     source_url = logo.url
+
+    # Para Wikimedia intentamos PRIMERO el repositorio tv-logo/tv-logos.
+    # Esto evita depender de Wikimedia para los logos que ya tienen una
+    # alternativa PNG optimizada para fondos oscuros.
+    if "wikimedia.org/" in source_url.lower():
+        alt_url = find_tv_logo(name, tvg_id, tv_logo_paths)
+        if alt_url:
+            try:
+                print(f"[+] Fallback preferido tv-logo/tv-logos: {name}")
+                return save_from_url(alt_url)
+            except Exception as exc:
+                print(
+                    f"[!] Fallback tv-logo fallo para {name}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     # Si el logo existente es un SVG de Wikimedia, primero pedimos un
     # thumbnail rasterizado. Pillow no necesita soportar SVG directamente.
@@ -724,11 +748,7 @@ def localize_logo(
             source_url = raster
 
     try:
-        data = download_logo_bytes(session, source_url)
-        target = logo_dir / image_slug(name, tvg_id)
-        ok, white_bg = rasterize_logo(data, target)
-        if ok:
-            return target, white_bg
+        return save_from_url(source_url)
     except Exception as exc:
         print(
             f"[!] Fuente primaria no disponible para {name}: "
@@ -736,18 +756,12 @@ def localize_logo(
             file=sys.stderr,
         )
 
-    # Fallback independiente de Wikimedia: tv-logo/tv-logos.
-    # Son PNG y el propio proyecto indica que estan preparados para fondos
-    # oscuros.
+    # Segundo fallback independiente de Wikimedia: tv-logo/tv-logos.
     alt_url = find_tv_logo(name, tvg_id, tv_logo_paths)
     if alt_url:
         try:
             print(f"[+] Fallback tv-logo/tv-logos: {name}")
-            data = download_logo_bytes(session, alt_url)
-            target = logo_dir / image_slug(name, tvg_id)
-            ok, white_bg = rasterize_logo(data, target)
-            if ok:
-                return target, white_bg
+            return save_from_url(alt_url)
         except Exception as exc:
             print(
                 f"[!] Fallback tv-logo fallo para {name}: "
