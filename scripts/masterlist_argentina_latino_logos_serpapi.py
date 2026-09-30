@@ -197,7 +197,16 @@ def search_name(entry: Entry) -> str:
 
 
 def google_query(entry: Entry) -> str:
-    return f'"{search_name(entry)}" logo'
+    # Desambiguamos el nombre para que Google busque el canal de TV y no
+    # empresas/marcas con las mismas siglas o palabras.
+    region = (
+        "Latin America"
+        if "premium" in canon(entry.group)
+        else "Argentina"
+    )
+    return (
+        f'"{search_name(entry)}" TV channel logo {region}'
+    )
 
 
 def safe_filename(entry: Entry) -> str:
