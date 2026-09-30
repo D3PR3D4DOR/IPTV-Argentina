@@ -768,7 +768,7 @@ def google_search(
         src = r.text
 
         blocks = re.findall(
-            r"\{[^{}]{0,2500}(?:\\?"ou\\?"|\\?"original\\?").{0,2500}\}",
+            r'\{[^{}]{0,2500}(?:"ou"|"original").{0,2500}\}',
             src,
             flags=re.IGNORECASE,
         )
