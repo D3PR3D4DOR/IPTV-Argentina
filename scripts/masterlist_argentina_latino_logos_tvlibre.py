@@ -5,6 +5,9 @@ Masterlist Argentina + Premium Latinoamerica - TVLibre Online Logo Manager
 Estrategia:
 - Descarga todos los logos que YA existen en la M3U desde sus URLs originales.
 - No reemplaza esos logos por búsquedas externas.
+- Nunca borra la carpeta de logos ni elimina un archivo anterior por un FAIL.
+- Detecta respuestas sospechosamente idénticas de muchas URLs distintas para evitar
+  guardar una misma imagen placeholder en cientos de canales.
 - Detecta los canales que no tienen tvg-logo.
 - Para los faltantes, busca el canal en https://tvlibreonline.st/
 - Extrae el logo de la página del canal.
@@ -36,7 +39,6 @@ import argparse
 import concurrent.futures
 import hashlib
 import re
-import shutil
 import shutil
 import sys
 import time
@@ -108,6 +110,7 @@ class Result:
     path: Path | None = None
     source: str = ""
     reason: str = ""
+    content_sha256: str = ""
 
 
 def canon(value: str) -> str:
@@ -338,8 +341,31 @@ def save_png(data: bytes, target: Path) -> tuple[int, int]:
     return padded.width, padded.height
 
 
-def download_existing(entry: Entry, logo_dir: Path) -> Result:
+def download_existing(
+    entry: Entry,
+    logo_dir: Path,
+    force_redownload: bool = False,
+) -> Result:
     target = logo_dir / image_filename(entry)
+
+    # Si ya tenemos un PNG válido, no lo volvemos a descargar ni lo pisamos.
+    # Esto evita destruir resultados buenos por un FAIL remoto.
+    if target.exists() and not force_redownload:
+        try:
+            with Image.open(target) as check:
+                check.verify()
+
+            return Result(
+                path=target,
+                source="M3U - EXISTENTE LOCAL",
+                reason=(
+                    "PNG local conservado; "
+                    f"URL original={entry.logo_url}"
+                ),
+            )
+        except Exception:
+            # Un archivo local inválido sí se puede regenerar.
+            target.unlink(missing_ok=True)
 
     session = make_session()
 
@@ -348,6 +374,12 @@ def download_existing(entry: Entry, logo_dir: Path) -> Result:
             session,
             entry.logo_url,
         )
+
+        # Validar que realmente sea una imagen antes de guardarla.
+        with Image.open(__import__("io").BytesIO(data)) as check:
+            check.verify()
+
+        content_sha256 = hashlib.sha256(data).hexdigest()
 
         width, height = save_png(
             data,
@@ -361,22 +393,25 @@ def download_existing(entry: Entry, logo_dir: Path) -> Result:
                 f"URL original; {width}x{height}px; "
                 f"{entry.logo_url}"
             ),
+            content_sha256=content_sha256,
         )
 
     except Exception as exc:
-        target.unlink(missing_ok=True)
+        # IMPORTANTE: no borrar un PNG anterior por un fallo remoto.
+        target_exists = target.exists()
 
         return Result(
-            source="M3U - ERROR",
+            path=target if target_exists else None,
+            source="M3U - ERROR DESCARGA",
             reason=(
                 f"{type(exc).__name__}: {exc} | "
                 f"{entry.logo_url}"
+                + (" | PNG local conservado" if target_exists else "")
             ),
         )
 
     finally:
         session.close()
-
 
 def site_names_for(entry: Entry) -> list[str]:
     if entry.name in SITE_NAME_OVERRIDES:
@@ -787,6 +822,11 @@ def main() -> int:
         help="no descargar los logos que ya existen",
     )
     parser.add_argument(
+        "--force-redownload-existing",
+        action="store_true",
+        help="volver a descargar los logos existentes y reemplazar el PNG local",
+    )
+    parser.add_argument(
         "--no-site",
         action="store_true",
         help="no buscar los logos faltantes en TVLibre",
@@ -810,13 +850,10 @@ def main() -> int:
         return 1
 
     if args.clean_logo_dir:
-        logo_dir = Path(args.logo_dir)
-
-        if logo_dir.exists():
-            print(
-                f"[+] Limpiando carpeta: {logo_dir}"
-            )
-            shutil.rmtree(logo_dir)
+        print(
+            "[!] --clean-logo-dir queda deshabilitado por seguridad: "
+            "el script NO borra la carpeta de logos ni sus archivos."
+        )
 
     lines, entries = load_m3u(input_path)
 
@@ -901,7 +938,11 @@ def main() -> int:
         jobs = list(url_owner.values())
 
         def download_unique(entry: Entry) -> tuple[str, Entry, Result]:
-            result = download_existing(entry, logo_dir)
+            result = download_existing(
+                entry,
+                logo_dir,
+                force_redownload=args.force_redownload_existing,
+            )
             return entry.logo_url, entry, result
 
         with concurrent.futures.ThreadPoolExecutor(
@@ -912,32 +953,97 @@ def main() -> int:
                 for entry in jobs
             ]
 
+            downloaded_by_url: dict[str, tuple[Entry, Result]] = {}
+
             for position, future in enumerate(
                 concurrent.futures.as_completed(futures),
                 start=1,
             ):
                 url, entry, result = future.result()
+
+                status = "OK" if result.path else "FAIL"
+
                 print(
                     f"[M3U {position:>3}/{len(jobs)}] "
-                    f"{'OK' if result.path else 'FAIL':<4} "
+                    f"{status:<4} "
                     f"{entry.name}"
                 )
 
-                # Guardar resultado del URL original.
-                if result.path:
-                    for target_entry in (
-                        existing + [
-                            x for x in additional_entries
-                            if x.logo_url == url
-                        ]
-                    ):
-                        target_key = (
-                            canon(target_entry.tvg_id),
-                            canon(target_entry.name),
-                        )
+                downloaded_by_url[url] = (entry, result)
 
-                        target = logo_dir / image_filename(target_entry)
+            # Varias URLs distintas devolviendo exactamente la misma imagen
+            # suele indicar placeholder, hotlink blocker o respuesta proxy.
+            # No guardamos esos resultados para evitar llenar logos/ con
+            # cientos de copias del mismo logo incorrecto.
+            hash_to_urls: dict[str, list[str]] = {}
 
+            for url, (_, result) in downloaded_by_url.items():
+                if result.path and result.content_sha256:
+                    hash_to_urls.setdefault(
+                        result.content_sha256,
+                        [],
+                    ).append(url)
+
+            suspicious_hashes = {
+                sha
+                for sha, urls in hash_to_urls.items()
+                if len(urls) >= 4
+            }
+
+            if suspicious_hashes:
+                print()
+                print(
+                    "[!] Se detectaron imágenes sospechosamente repetidas "
+                    f"en {sum(len(hash_to_urls[h]) for h in suspicious_hashes)} "
+                    "URLs distintas."
+                )
+                print(
+                    "[!] Esas imágenes NO se usarán como logos válidos."
+                )
+
+            for url, (entry, result) in downloaded_by_url.items():
+                if (
+                    result.content_sha256
+                    and result.content_sha256 in suspicious_hashes
+                    and result.source == "M3U"
+                ):
+                    result.path.unlink(missing_ok=True)
+
+                    downloaded_by_url[url] = (
+                        entry,
+                        Result(
+                            source="M3U - IMAGEN SOSPECHOSA",
+                            reason=(
+                                "La URL devolvió una imagen idéntica a "
+                                "3 o más URLs distintas; posible placeholder. "
+                                f"url={url}"
+                            ),
+                        ),
+                    )
+
+            # Guardar/copiar el resultado del URL original solo después
+            # de pasar la validación anterior.
+            for position, (url, (entry, result)) in enumerate(
+                downloaded_by_url.items(),
+                start=1,
+            ):
+                shared_entries = [
+                    x for x in existing
+                    if x.logo_url == url
+                ] + [
+                    x for x in additional_entries
+                    if x.logo_url == url
+                ]
+
+                for target_entry in shared_entries:
+                    target_key = (
+                        canon(target_entry.tvg_id),
+                        canon(target_entry.name),
+                    )
+
+                    target = logo_dir / image_filename(target_entry)
+
+                    if result.path:
                         if target_entry is entry:
                             existing_results[target_key] = result
                             continue
@@ -963,21 +1069,8 @@ def main() -> int:
                                     f"url={url}"
                                 ),
                             )
-                else:
-                    # Todos los canales que usan la misma URL quedan marcados
-                    # con el mismo fallo.
-                    for target_entry in (
-                        existing + [
-                            x for x in additional_entries
-                            if x.logo_url == url
-                        ]
-                    ):
-                        existing_results[
-                            (
-                                canon(target_entry.tvg_id),
-                                canon(target_entry.name),
-                            )
-                        ] = result
+                    else:
+                        existing_results[target_key] = result
 
     # ---------------------------------------------------------------
     # 2) Preparar links de TVLibre y resolver faltantes.
@@ -1069,10 +1162,12 @@ def main() -> int:
         f"M3U principal: {input_path}",
         "",
         "REGLAS:",
-        "- Logos existentes: se conservan; se descarga su URL original.",
+        "- Logos existentes: se conservan; se usa su URL original como fuente.",
         "- Logos faltantes: se buscan exclusivamente en TVLibre Online.",
         "- Fuzzy matching: desactivado.",
         "- No se modifican streams ni #EXTVLCOPT.",
+        "- Nunca se borra la carpeta de logos por un FAIL.",
+        "- Respuestas idénticas de muchas URLs distintas se marcan como sospechosas.",
         "",
     ]
 
@@ -1158,6 +1253,10 @@ def main() -> int:
     output_path = Path(args.output)
     report_path = Path(args.report)
 
+    # El directorio de logos es deliberadamente acumulativo y seguro:
+    # no se limpia automáticamente.
+
+
     save_m3u(
         output_path,
         lines,
@@ -1169,7 +1268,7 @@ def main() -> int:
         "-" * 78,
         f"EXTINF: {after_extinf}/{before_extinf}",
         f"Logos existentes descargados: {ok_existing}",
-        f"Logos existentes con error: {fail_existing}",
+        f"Logos existentes con error real: {fail_existing}",
         f"Logos faltantes resueltos por TVLibre: {ok_site}",
         f"Logos faltantes pendientes: {pending_site}",
         "",
