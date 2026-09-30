@@ -763,13 +763,20 @@ def main() -> int:
 
     additional = load_sources(args.source_m3u)
 
-    # Para descargar logos existentes, usamos principal + fuentes adicionales.
-    source_entries = (
-        [entry for entry in main_entries if entry.logo_url]
-        + [entry for entry in additional if entry.logo_url]
-    )
+    main_existing = [
+        entry for entry in main_entries
+        if entry.logo_url
+    ]
 
-    # Evitar descargar exactamente la misma URL varias veces.
+    extra_existing = [
+        entry for entry in additional
+        if entry.logo_url
+    ]
+
+    # Todos los logos disponibles se descargan, pero los logos de la M3U
+    # principal mantienen prioridad cuando ese canal ya tiene tvg-logo.
+    source_entries = main_existing + extra_existing
+
     unique_existing: dict[tuple[str, str, str], Entry] = {}
 
     for entry in source_entries:
@@ -778,7 +785,7 @@ def main() -> int:
             canon(entry.name),
             entry.logo_url,
         )
-        unique_existing[key] = entry
+        unique_existing.setdefault(key, entry)
 
     existing = list(unique_existing.values())
     missing = [
@@ -825,6 +832,11 @@ def main() -> int:
     # ---------------------------------------------------------------
     # 1) Descargar logos que ya existen.
     # ---------------------------------------------------------------
+    main_existing_keys = {
+        (canon(entry.tvg_id), canon(entry.name))
+        for entry in main_existing
+    }
+
     existing_results: dict[
         tuple[str, str],
         Result,
@@ -850,10 +862,13 @@ def main() -> int:
             logo_dir,
         )
 
-        # Para una misma clave se conserva el primer resultado OK.
-        if key not in existing_results or (
-            not existing_results[key].path and result.path
-        ):
+        # La M3U principal es la referencia de verdad:
+        # una M3U adicional nunca puede sobrescribir su logo.
+        if key not in existing_results:
+            existing_results[key] = result
+        elif key in main_existing_keys and result.path:
+            existing_results[key] = result
+        elif not existing_results[key].path and result.path:
             existing_results[key] = result
 
         print(
