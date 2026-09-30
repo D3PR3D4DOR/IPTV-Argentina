@@ -12,9 +12,8 @@ Objetivo:
 
 Fuentes de logo, en este orden general:
 1. tv-logo/tv-logos
-2. Fourqui/tv
-3. logo-tv/tv-logos
-4. hmlendea/tv-logos
+2. logo-tv/tv-logos
+3. hmlendea/tv-logos
 5. iptv-org
 6. logo actual de la M3U
 7. Wikimedia Commons
@@ -48,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import html
 import io
 import json
@@ -78,7 +78,6 @@ COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 
 GITHUB_TREE_SOURCES = [
     ("tv-logo/tv-logos", "main", "tv-logo"),
-    ("Fourqui/tv", "main", "fourqui"),
     ("logo-tv/tv-logos", "main", "logo-tv"),
     ("hmlendea/tv-logos", "master", "hmlendea"),
 ]
@@ -97,7 +96,6 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 # una copia PNG y evitan depender de un servidor externo.
 SOURCE_PRIORITY = {
     "tv-logo": 100,
-    "fourqui": 96,
     "logo-tv": 92,
     "hmlendea": 88,
     "iptv-org": 84,
@@ -225,9 +223,10 @@ def region_score(value: str) -> float:
 def image_slug(name: str, tvg_id: str) -> str:
     base = canon(tvg_id) or canon(name) or "channel"
     base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
-    digest = SequenceMatcher(None, name, tvg_id).ratio()
-    suffix = f"{int(digest * 1_000_000):06d}"
-    return f"{base[:70]}-{suffix}.png"
+    digest = hashlib.sha1(
+        f"{tvg_id}|{name}".encode("utf-8")
+    ).hexdigest()[:10]
+    return f"{base[:70]}-{digest}.png"
 
 
 def extract_attr(line: str, attr: str) -> str:
@@ -570,14 +569,12 @@ def github_logo_candidates(
 
     source_priority = {
         "tv-logo": 100,
-        "fourqui": 96,
         "logo-tv": 92,
         "hmlendea": 88,
     }
 
     raw_base = {
         "tv-logo": "https://raw.githubusercontent.com/tv-logo/tv-logos/main/",
-        "fourqui": "https://raw.githubusercontent.com/Fourqui/tv/main/",
         "logo-tv": "https://raw.githubusercontent.com/logo-tv/tv-logos/main/",
         "hmlendea": "https://raw.githubusercontent.com/hmlendea/tv-logos/master/",
     }
@@ -1029,60 +1026,6 @@ def candidate_score(
     )
 
 
-def find_best_local_logo(
-    entry: ChannelEntry,
-    channel_index: dict[str, list[dict]],
-    github_indexes: dict[str, list[str]],
-    session: requests.Session,
-    allow_web_search: bool,
-    candidate_limit: int,
-) -> LogoCandidate | None:
-    premium = canon(entry.group) == "premium latinoamerica"
-
-    candidates: list[LogoCandidate] = []
-
-    candidates.extend(
-        choose_iptv_logo(
-            entry.tvg_id,
-            channel_index,
-        )
-    )
-    candidates.extend(
-        github_logo_candidates(
-            entry.name,
-            entry.tvg_id,
-            github_indexes,
-        )
-    )
-    candidates.extend(
-        current_logo_candidate(entry)
-    )
-
-    # Ordenamos y probamos primero las fuentes estructuradas.
-    candidates.sort(
-        key=lambda item: (
-            SOURCE_PRIORITY.get(item.source, 50),
-            item.match,
-        ),
-        reverse=True,
-    )
-
-    if allow_web_search and not candidates:
-        candidates.extend(
-            wikimedia_search(session, entry.name, premium)
-        )
-        candidates.extend(
-            bing_image_search(session, entry.name, premium)
-        )
-        candidates.extend(
-            google_image_search(session, entry.name, premium)
-        )
-
-    # Aunque haya candidatos estructurados, si todos fallan al descargar,
-    # el llamador volvera a intentar las busquedas web.
-    return candidates[:candidate_limit][0] if candidates else None
-
-
 def all_candidates_for_entry(
     entry: ChannelEntry,
     channel_index: dict[str, list[dict]],
@@ -1193,8 +1136,8 @@ def main() -> int:
     parser.add_argument(
         "--workers",
         type=int,
-        default=4,
-        help="descargas simultaneas de logos (default: 4)",
+        default=2,
+        help="descargas simultaneas de logos (default: 2)",
     )
     parser.add_argument(
         "--candidate-limit",
@@ -1253,56 +1196,21 @@ def main() -> int:
     github_indexes = build_github_logo_index(session)
 
     # -----------------------------------------------------------------------
-    # Primero armamos el conjunto de candidatos. Las busquedas web se hacen
-    # por canal en paralelo despues de tener las fuentes estructuradas.
+    # Procesamos cada canal de punta a punta. Asi no hay una fase previa que
+    # parezca congelada mientras se calculan candidatos para los 186 canales.
     # -----------------------------------------------------------------------
     web_search = not args.no_web_search
 
-    candidate_map: dict[int, list[LogoCandidate]] = {}
-
-    def build_for_entry(
-        entry: ChannelEntry,
-    ) -> tuple[int, list[LogoCandidate]]:
-        local_session = requests.Session()
-        try:
-            candidates = all_candidates_for_entry(
-                entry,
-                channel_index,
-                github_indexes,
-                local_session,
-                web_search,
-            )
-            return entry.index, candidates
-        finally:
-            local_session.close()
-
-    print("[+] Fuentes estructuradas: tv-logo, Fourqui, logo-tv, hmlendea, iptv-org y M3U.")
+    print("[+] Fuentes estructuradas: tv-logo, logo-tv, hmlendea, iptv-org y M3U.")
     if web_search:
         print("[+] Google/Bing/Wikimedia se usaran solo como fallback.")
-    print("[+] Buscando candidatos para los canales...")
+    print("[+] Descargando y normalizando logos...")
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=args.workers
-    ) as executor:
-        futures = [
-            executor.submit(build_for_entry, entry)
-            for entry in entries
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            index, candidates = future.result()
-            candidate_map[index] = candidates
-
-    # -----------------------------------------------------------------------
-    # Descargar y validar. Se hace con pocas conexiones simultaneas para no
-    # saturar hosts de logos.
-    # -----------------------------------------------------------------------
     results: dict[int, LogoResult] = {}
     counts: dict[str, int] = {}
     failures: dict[int, list[str]] = {}
 
     def process_entry(entry: ChannelEntry) -> tuple[int, LogoResult]:
-        candidates = candidate_map.get(entry.index, [])
         target = logo_dir / image_slug(
             entry.name,
             entry.tvg_id,
@@ -1312,6 +1220,14 @@ def main() -> int:
             target.unlink()
 
         local_session = requests.Session()
+
+        candidates = all_candidates_for_entry(
+            entry,
+            channel_index,
+            github_indexes,
+            local_session,
+            web_search,
+        )
 
         def try_pool(pool: list[LogoCandidate]) -> Optional[LogoResult]:
             ordered = sorted(
@@ -1451,10 +1367,11 @@ def main() -> int:
             results[index] = result
 
             state = "OK" if result.path else "FAIL"
+            entry = next(x for x in entries if x.index == index)
             print(
                 f"[{done:>3}/{len(entries)}] "
                 f"{state:<4} "
-                f"{entries[[x.index for x in entries].index(index)].name}"
+                f"{entry.name}"
             )
 
     # -----------------------------------------------------------------------
