@@ -167,7 +167,7 @@ https://stream.arcast.net:4443/correadigital/canal12/playlist.m3u8
 https://617c5175c970b.streamlock.net:4444/13max2/live13maxtv2026/playlist.m3u8
 #EXTINF:-1 tvg-id="CosmosTv.ar" tvg-name="Cosmos Tv" tvg-logo="https://cdn4.fmcosmos.com/s4/2025/11/03/fmcosmos/images/15/92/159284_a18e887e336fef3bc6b188314a173ce10cbe5157966e839517e2b0428d7aed46/xs.webp" tvg-country="AR" tvg-language="spa" group-title="Movies" nexus-score="100",Cosmos Tv
 https://tv.mediacp.eu:19360/cosmos/cosmos.m3u8
-#EXTINF:-1 tvg-id="CronicaTV.ar@SD" tvg-name="Crónica TV" tvg-logo="https://raw.githubusercontent.com/iptv-org/database/master/resources/logos/CronicaTV.png" tvg-country="AR" tvg-language="spa" group-title="News",Crónica TV (1080p)
+#EXTINF:-1 tvg-id="CronicaTV.ar@SD" tvg-name="Crónica TV" tvg-logo="https://raw.githubusercontent.com/D3PR3D4DOR/IPTV-Argentina/refs/heads/main/logos/CronicaTV.png" tvg-country="AR" tvg-language="spa" group-title="News",Crónica TV (1080p)
 http://181.209.105.115:2525/play/cronica/index.m3u8
 #EXTINF:-1 tvg-id="CumbiaMix.ar" tvg-name="Cumbia Mix" tvg-logo="https://qtrypzzcjebvfcihiynt.supabase.co/storage/v1/object/public/base44-prod/public/6901dfd41a05195b77301d7b/b306e57e4_Logo-TV-C.png" tvg-country="AR" tvg-language="spa" group-title="Music" nexus-score="95",Cumbia Mix (720p)
 https://cloud.tvomix.com/CUMBIAMIX/index.m3u8
